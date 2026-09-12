@@ -200,8 +200,12 @@ function ccuCaptureLocalScrollPositions(panel) {
   var positions = [];
   ccuRefreshScrollerEntries(panel).forEach(function(entry) {
     var scroller = entry.scroller;
-    if (!(scroller.scrollLeft > 0)) { return; }
-    positions.push({ key: entry.key, scrollLeft: scroller.scrollLeft });
+    if (!(scroller.scrollLeft > 0) && !(scroller.scrollTop > 0)) { return; }
+    positions.push({
+      key: entry.key,
+      scrollLeft: scroller.scrollLeft,
+      scrollTop: scroller.scrollTop
+    });
   });
   return positions;
 }
@@ -210,13 +214,89 @@ function ccuRestoreLocalScrollPositions(positions, panel) {
   if (!positions || positions.length === 0) { return; }
   var saved = {};
   positions.forEach(function(position) {
-    if (position && typeof position.key === 'string' && typeof position.scrollLeft === 'number') {
-      saved[position.key] = position.scrollLeft;
+    if (
+      position &&
+      typeof position.key === 'string' &&
+      typeof position.scrollLeft === 'number' &&
+      typeof position.scrollTop === 'number'
+    ) {
+      saved[position.key] = {
+        scrollLeft: position.scrollLeft,
+        scrollTop: position.scrollTop
+      };
     }
   });
   ccuRefreshScrollerEntries(panel).forEach(function(entry) {
     if (Object.prototype.hasOwnProperty.call(saved, entry.key)) {
-      entry.scroller.scrollLeft = saved[entry.key];
+      entry.scroller.scrollLeft = saved[entry.key].scrollLeft;
+      entry.scroller.scrollTop = saved[entry.key].scrollTop;
+    }
+  });
+}
+
+function ccuCaptureAdvicePreviews(panel) {
+  var previews = [];
+  panel.querySelectorAll('.advice-payload-preview[data-advice-preview]').forEach(function(preview) {
+    var provider = preview.getAttribute('data-advice-preview');
+    var snapshotId = preview.getAttribute('data-snapshot-id');
+    var body = preview.querySelector('[data-advice-preview-body]');
+    if (
+      (provider !== 'claude' && provider !== 'codex') ||
+      !snapshotId ||
+      !/^snapshot-[a-f0-9]{24}$/.test(snapshotId) ||
+      !body ||
+      body.textContent.length > 16 * 1024 * 1024
+    ) { return; }
+    var elements = adviceConsentElements(provider);
+    previews.push({
+      provider: provider,
+      snapshotId: snapshotId,
+      hidden: preview.hidden,
+      open: preview.open,
+      body: body.textContent,
+      digest: (preview.querySelector('[data-advice-preview-digest]') || {}).textContent || '',
+      mode: (preview.querySelector('[data-advice-preview-mode]') || {}).textContent || '',
+      contentType: (preview.querySelector('[data-advice-preview-content-type]') || {}).textContent || '',
+      bytes: (preview.querySelector('[data-advice-preview-bytes]') || {}).textContent || '',
+      count: (preview.querySelector('[data-advice-preview-count]') || {}).textContent || '',
+      sendDisabled: elements.sendButton ? elements.sendButton.disabled : true,
+      sendText: elements.sendButton ? elements.sendButton.textContent : '',
+      statusText: elements.consentStatus ? elements.consentStatus.textContent : ''
+    });
+  });
+  return previews;
+}
+
+function ccuRestoreAdvicePreviews(previews) {
+  (previews || []).forEach(function(saved) {
+    if (
+      !saved ||
+      (saved.provider !== 'claude' && saved.provider !== 'codex') ||
+      typeof saved.snapshotId !== 'string' ||
+      !/^snapshot-[a-f0-9]{24}$/.test(saved.snapshotId)
+    ) { return; }
+    var elements = adviceConsentElements(saved.provider);
+    if (!elements.preview) { return; }
+    var preview = elements.preview;
+    var setText = function(selector, value) {
+      var target = preview.querySelector(selector);
+      if (target && typeof value === 'string') { target.textContent = value; }
+    };
+    setText('[data-advice-preview-body]', saved.body);
+    setText('[data-advice-preview-digest]', saved.digest);
+    setText('[data-advice-preview-mode]', saved.mode);
+    setText('[data-advice-preview-content-type]', saved.contentType);
+    setText('[data-advice-preview-bytes]', saved.bytes);
+    setText('[data-advice-preview-count]', saved.count);
+    preview.setAttribute('data-snapshot-id', saved.snapshotId);
+    preview.hidden = saved.hidden === true;
+    preview.open = saved.open === true;
+    if (elements.sendButton) {
+      elements.sendButton.disabled = saved.sendDisabled !== false;
+      if (typeof saved.sendText === 'string') { elements.sendButton.textContent = saved.sendText; }
+    }
+    if (elements.consentStatus && typeof saved.statusText === 'string') {
+      elements.consentStatus.textContent = saved.statusText;
     }
   });
 }
@@ -279,6 +359,7 @@ function ccuCaptureRefreshContext(panel) {
     focus: focus,
     anchor: ccuCaptureRefreshAnchor(panel, focus),
     controls: controls,
+    advicePreviews: ccuCaptureAdvicePreviews(panel),
     localScrollPositions: ccuCaptureLocalScrollPositions(panel),
     scrollY: window.scrollY
   };
@@ -332,7 +413,6 @@ function ccuRestoreDashboardUiAfterPatch(context, panel, tab) {
   restorePersistedDetails();
   restoreClaudeDrilldownDetails();
   restoreCodexHourlyDetails();
-  restoreAdviceEffectivenessState();
   restoreSessionDetails();
   restoreTableSorts(panel);
   restoreChartMetrics(panel);
@@ -343,6 +423,8 @@ function ccuRestoreDashboardUiAfterPatch(context, panel, tab) {
   restoreCombinedHeatmapConfig();
   restoreProjectMatrixState(panel);
   ccuRestoreTransientControls(context, panel);
+  restoreAdviceEffectivenessState();
+  ccuRestoreAdvicePreviews(context.advicePreviews);
   formatOptSettings();
   requestLocalDataInventoryForVisibleSettings();
   ccuRestoreRefreshPosition(context, panel);
