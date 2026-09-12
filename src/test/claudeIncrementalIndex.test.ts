@@ -185,6 +185,113 @@ test('content analysis is materialized from per-file contributions without a sec
   assert.deepEqual(warm.contentAnalysis, warmFull.contentAnalysis);
 });
 
+test('default content analysis does not revisit historical file contributions after a small append', async () => {
+  const previousNow = Date.now;
+  Date.now = () => Date.parse('2026-09-10T12:00:00.000Z');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ccu-claude-content-scale-'));
+  roots.push(root);
+  const project = path.join(root, 'projects', '-fixture-content-scale');
+  await mkdir(project, { recursive: true });
+  const files: string[] = [];
+  try {
+    for (let index = 0; index < 256; index += 1) {
+      const file = path.join(project, `session-${String(index).padStart(3, '0')}.jsonl`);
+      files.push(file);
+      await writeFile(file, `${usageLine(`content-scale-${index}`, index + 1, 1, {
+        timestamp: new Date(Date.parse('2026-09-09T00:00:00.000Z') + index * 1_000).toISOString(),
+      })}\n`, 'utf8');
+    }
+    const cold = await updateClaudeUsageIndex(createClaudeUsageIndex(), root);
+    assert.equal(cold.diagnostics.bodyReads, 256);
+
+    let historicalContributionReads = 0;
+    for (const file of cold.index.files.values()) {
+      if (file.path === files[files.length - 1] || !file.analysis) continue;
+      const categories = file.analysis.cat;
+      Object.defineProperty(file.analysis, 'cat', {
+        configurable: true,
+        get: () => {
+          historicalContributionReads += 1;
+          return categories;
+        },
+      });
+    }
+
+    const tail = `${usageLine('content-scale-tail', 9, 3, {
+      timestamp: '2026-09-09T00:10:00.000Z',
+    })}\n`;
+    await appendFile(files[files.length - 1], tail, 'utf8');
+    const warm = await updateClaudeUsageIndex(cold.index, root);
+    const full = await ClaudeDataLoader.loadUsageRecords(root, { analyzeContent: true });
+
+    assert.equal(warm.diagnostics.bodyReads, 1);
+    assert.equal(warm.diagnostics.bytesRead, Buffer.byteLength(tail));
+    assert.equal(historicalContributionReads, 0);
+    assert.deepEqual(warm.contentAnalysis, full.contentAnalysis);
+  } finally {
+    Date.now = previousNow;
+  }
+});
+
+test('content analysis expires a completed boundary file after configured-zone midnight without source reads', async () => {
+  const previousNow = Date.now;
+  const previousTimeZone = I18n.getTimezone();
+  let now = Date.parse('2026-09-10T15:59:30.000Z');
+  Date.now = () => now;
+  I18n.setTimezone('Asia/Hong_Kong');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ccu-claude-content-expiry-'));
+  roots.push(root);
+  const project = path.join(root, 'projects', '-fixture-content-expiry');
+  await mkdir(project, { recursive: true });
+  try {
+    await writeFile(
+      path.join(project, 'boundary.jsonl'),
+      `${usageLine('content-boundary', 40, 4, { timestamp: '2026-08-11T16:00:00.000Z' })}\n`,
+      'utf8',
+    );
+    await writeFile(
+      path.join(project, 'active.jsonl'),
+      `${usageLine('content-active', 20, 2, { timestamp: '2026-09-10T15:00:00.000Z' })}\n`,
+      'utf8',
+    );
+    const cold = await updateClaudeUsageIndex(createClaudeUsageIndex(), root, {
+      analyzeContent: true,
+      windowDays: 30,
+    });
+    assert.equal(
+      cold.contentAnalysis?.categories.find((slice) => slice.key === 'assistantText')?.count,
+      2,
+    );
+
+    now = Date.parse('2026-09-10T16:00:30.000Z');
+    const warm = await updateClaudeUsageIndex(cold.index, root, {
+      analyzeContent: true,
+      windowDays: 30,
+    });
+    const full = await ClaudeDataLoader.loadUsageRecords(root, {
+      analyzeContent: true,
+      windowDays: 30,
+    });
+
+    assert.equal(warm.diagnostics.bodyReads, 0);
+    assert.deepEqual(warm.diagnostics.changed, {
+      append: 0,
+      rebuild: 0,
+      move: 0,
+      delete: 0,
+    });
+    assert.ok(warm.index.analysisCutoffMs > cold.index.analysisCutoffMs);
+    assert.equal(
+      warm.contentAnalysis?.categories.find((slice) => slice.key === 'assistantText')?.count,
+      1,
+    );
+    assert.deepEqual(warm.contentAnalysis, full.contentAnalysis);
+  } finally {
+    Date.now = previousNow;
+    I18n.setTimezone(previousTimeZone);
+  }
+});
+
 test('cross-file content UUID clones keep the legacy first-owner deduplication', async () => {
   const { root, first, second } = await fixture();
   const cloned = JSON.stringify({
