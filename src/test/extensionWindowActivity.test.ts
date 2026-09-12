@@ -76,6 +76,10 @@ function bareExtension(): any {
   extension.fileWatcherGeneration = 0;
   extension.codexWatcherGeneration = 0;
   extension.credentialsWatcherGeneration = 0;
+  extension.credentialsWatcherMissingFilenameEventsSinceRefresh = 0;
+  extension.codexWatcherEventsSinceRefresh = 0;
+  extension.codexCoalescedTriggersSinceRefresh = 0;
+  extension.codexWatchDebouncePending = false;
   extension.disposed = false;
   extension.codexBackgroundState = createBackgroundWorkState({
     measurementVersion: 1,
@@ -1562,6 +1566,203 @@ test('unchanged Claude history republishes Today and rolling 30 days at configur
     I18n.setTimezone(originalTimeZone);
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('credentials watcher counts unnamed events without exposing filenames', async () => {
+  const extension = bareExtension();
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'ccu-credentials-watch-event-'));
+  const originalWatch = fs.watch;
+  let listener: ((eventType: string, filename: string | Buffer | null) => void) | undefined;
+  let watcherClosed = 0;
+  extension.windowActivity = new WindowActivityGate(true);
+  extension.apiClient = {
+    getCredentialsPath: () => path.join(profile, '.credentials.json'),
+  };
+  (fs as any).watch = (
+    directory: string,
+    callback: (eventType: string, filename: string | Buffer | null) => void,
+  ) => {
+    assert.equal(directory, profile);
+    listener = callback;
+    const watcher = {
+      close: () => { watcherClosed += 1; },
+      on: () => watcher,
+    };
+    return watcher;
+  };
+
+  try {
+    extension.startCredentialsWatching();
+    assert.ok(listener);
+    listener('rename', null);
+    listener('change', 'unrelated.json');
+    assert.equal(extension.credentialsWatcherMissingFilenameEventsSinceRefresh, 1);
+  } finally {
+    extension.stopCredentialsWatching();
+    await extension.drainResourceStops();
+    (fs as any).watch = originalWatch;
+    fs.rmSync(profile, { recursive: true, force: true });
+  }
+  assert.equal(watcherClosed, 1);
+});
+
+test('credentials watcher errors reuse bounded recovery and cannot rearm after disposal', async () => {
+  const extension = bareExtension();
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'ccu-credentials-watch-error-'));
+  const originalWatch = fs.watch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const errorListeners: Array<(error: Error) => void> = [];
+  const retryCallbacks: Array<() => void> = [];
+  const retryDelays: number[] = [];
+  const clearedTimers: number[] = [];
+  const diagnostics: string[] = [];
+  let nextTimer = 0;
+  let watchCalls = 0;
+  let watcherClosed = 0;
+
+  extension.windowActivity = new WindowActivityGate(true);
+  extension.outputChannel = { appendLine: (line: string) => diagnostics.push(line) };
+  extension.apiClient = {
+    getCredentialsPath: () => path.join(profile, '.credentials.json'),
+  };
+  (fs as any).watch = () => {
+    watchCalls += 1;
+    const watcher = {
+      close: () => { watcherClosed += 1; },
+      on: (event: string, listener: (error: Error) => void) => {
+        if (event === 'error') errorListeners.push(listener);
+        return watcher;
+      },
+    };
+    return watcher;
+  };
+  globalThis.setTimeout = ((callback: () => void, milliseconds?: number) => {
+    retryCallbacks.push(callback);
+    retryDelays.push(milliseconds ?? 0);
+    nextTimer += 1;
+    return nextTimer as unknown as NodeJS.Timeout;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((timer: NodeJS.Timeout) => {
+    clearedTimers.push(timer as unknown as number);
+  }) as typeof clearTimeout;
+
+  try {
+    extension.startCredentialsWatching();
+    assert.equal(watchCalls, 1);
+    assert.equal(errorListeners.length, 1, 'the watcher must handle asynchronous fs.watch errors');
+
+    errorListeners[0](Object.assign(new Error('credentials watch resources exhausted'), { code: 'EMFILE' }));
+    await extension.drainResourceStops();
+    assert.equal(extension.credsWatcher, undefined);
+    assert.equal(watcherClosed, 1);
+    assert.deepEqual(retryDelays, [1_000]);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.timer, 1);
+
+    retryCallbacks[0]();
+    await extension.drainResourceStops();
+    assert.equal(watchCalls, 2, 'the first retry rearms the credentials watcher');
+    assert.equal(errorListeners.length, 2);
+
+    errorListeners[1](Object.assign(new Error('credentials watch resources still exhausted'), { code: 'ENOSPC' }));
+    await extension.drainResourceStops();
+    assert.deepEqual(retryDelays, [1_000, 2_000], 'consecutive failures back off instead of hot-looping');
+
+    const staleRetry = retryCallbacks[1];
+    extension.disposed = true;
+    extension.stopCredentialsWatching('extension-dispose');
+    await extension.drainResourceStops();
+    staleRetry();
+    assert.equal(watchCalls, 2, 'a cancelled disposal retry cannot recreate the watcher');
+    assert.deepEqual(clearedTimers, [2]);
+    assert.equal(extension.resourceOwnership.snapshotForTests().activeCount, 0);
+    assert.match(diagnostics.join('\n'), /Claude credentials/);
+    assert.match(diagnostics.join('\n'), /EMFILE/);
+    assert.match(diagnostics.join('\n'), /ENOSPC/);
+    assert.match(diagnostics.join('\n'), /poll/i);
+    assert.doesNotMatch(diagnostics.join('\n'), new RegExp(profile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  } finally {
+    extension.stopCredentialsWatching();
+    (fs as any).watch = originalWatch;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+    fs.rmSync(profile, { recursive: true, force: true });
+  }
+});
+
+test('Codex diagnostics retain trigger, watcher coalescing, backfill, and worker mode', async () => {
+  const extension = bareExtension();
+  const snapshot = snapshotFixture();
+  const diagnostics: string[] = [];
+  extension.codexWatcherEventsSinceRefresh = 7;
+  extension.codexCoalescedTriggersSinceRefresh = 5;
+  extension.getConfiguration = () => ({ codexEnabled: true });
+  extension.windowActivity = new WindowActivityGate(true);
+  extension.outputChannel = { appendLine: (line: string) => diagnostics.push(line) };
+  extension.webviewProvider = { updateCodexProgress: () => undefined };
+  extension.syncProviderUi = () => undefined;
+  extension.codexProvider = {
+    isAvailable: async () => true,
+    loadPersistedSnapshot: async () => snapshot,
+    refresh: async (workerMode: string, _onProgress: unknown, historical: boolean) => {
+      assert.equal(workerMode, 'foreground');
+      assert.equal(historical, true);
+      return {
+        outcome: 'success',
+        snapshot,
+        diagnostic: {
+          bodyReads: 0,
+          failedFiles: 0,
+          metadataMs: 1,
+          parseMs: 2,
+          migrationPending: false,
+        },
+      };
+    },
+  };
+
+  await extension.runCodexRefresh('manual');
+
+  assert.match(
+    diagnostics.join('\n'),
+    /codex-index trigger=manual outcome=success mode\(backfill=historical worker=foreground\) events\(watcher=7 coalesced=5\)/,
+  );
+  assert.equal(extension.codexWatcherEventsSinceRefresh, 0);
+  assert.equal(extension.codexCoalescedTriggersSinceRefresh, 0);
+});
+
+test('Claude refresh diagnostics drain the unnamed quota-watcher event count', async () => {
+  const extension = bareExtension();
+  const originalFind = ClaudeDataLoader.findClaudeDataDirectory;
+  const diagnostics: string[] = [];
+  extension.refreshGate = new RefreshSingleFlight();
+  extension.credentialsWatcherMissingFilenameEventsSinceRefresh = 3;
+  extension.cache = {
+    manifest: null,
+    usageLimits: {},
+  };
+  extension.getConfiguration = () => ({ dashboardAutoRefresh: false });
+  extension.maybeFetchUsageLimits = async () => ({});
+  extension.refreshCodexData = async () => undefined;
+  extension.statusBar = {
+    updateQuota: () => undefined,
+    updateUsageData: () => undefined,
+    updateContext: () => undefined,
+  };
+  extension.webviewProvider = { updateQuota: () => undefined };
+  extension.syncProviderUi = () => undefined;
+  extension.outputChannel = { appendLine: (line: string) => diagnostics.push(line) };
+  (ClaudeDataLoader as any).findClaudeDataDirectory = async () => null;
+
+  try {
+    await extension.refreshData(false, 'credentials');
+  } finally {
+    (ClaudeDataLoader as any).findClaudeDataDirectory = originalFind;
+  }
+
+  assert.match(diagnostics.join('\n'), /refresh: trigger=credentials/);
+  assert.match(diagnostics.join('\n'), /events\(watcher=0 coalesced=0 quota-unnamed=3\)/);
+  assert.equal(extension.credentialsWatcherMissingFilenameEventsSinceRefresh, 0);
 });
 
 test('real Claude filesystem events flow through manifest, index, and dashboard refresh', {
