@@ -6,6 +6,7 @@ import {
   mkdtemp,
   rename,
   rm,
+  stat,
   unlink,
   writeFile,
 } from 'node:fs/promises';
@@ -17,6 +18,7 @@ import {
   createClaudeUsageIndex,
   updateClaudeUsageIndex,
 } from '../claudeIncrementalIndex';
+import { UsageManifest } from '../claudeUsageFiles';
 import { ClaudeDataLoader } from '../dataLoader';
 import { I18n } from '../i18n';
 import { ClaudeUsageRecord } from '../types';
@@ -90,6 +92,20 @@ function analysisTextLine(
   });
 }
 
+function analysisBlocksLine(
+  uuid: string,
+  role: 'assistant' | 'user',
+  content: Record<string, unknown>[],
+  timestamp: string,
+): string {
+  return JSON.stringify({
+    type: role,
+    uuid,
+    timestamp,
+    message: { role, content },
+  });
+}
+
 function skillInvocationLines(
   prefix: string,
   count: number,
@@ -140,6 +156,40 @@ async function fixture(): Promise<{ root: string; first: string; second: string 
     branch: 'feature',
   })}\n`, 'utf8');
   return { root, first, second };
+}
+
+async function manifestInOrder(files: readonly string[]): Promise<UsageManifest> {
+  const entries = new Map();
+  for (const [discoveryIndex, file] of files.entries()) {
+    const fileStat = await stat(file);
+    entries.set(file, {
+      path: file,
+      size: fileStat.size,
+      mtimeMs: fileStat.mtimeMs,
+      discoveryIndex,
+      dev: fileStat.dev > 0 && fileStat.ino > 0 ? fileStat.dev : undefined,
+      ino: fileStat.dev > 0 && fileStat.ino > 0 ? fileStat.ino : undefined,
+    });
+  }
+  return { entries, scannedAtMs: Date.now(), scanDurationMs: 0 };
+}
+
+function deepFreeze(value: unknown, seen = new Set<object>()): void {
+  if (!value || typeof value !== 'object' || seen.has(value as object)) return;
+  seen.add(value as object);
+  if (value instanceof Map) {
+    for (const [key, item] of value) {
+      deepFreeze(key, seen);
+      deepFreeze(item, seen);
+    }
+  } else if (value instanceof Set) {
+    for (const item of value) deepFreeze(item, seen);
+  } else {
+    for (const key of Reflect.ownKeys(value)) {
+      deepFreeze((value as Record<PropertyKey, unknown>)[key], seen);
+    }
+  }
+  Object.freeze(value);
 }
 
 function normalized(records: readonly ClaudeUsageRecord[]): unknown[] {
@@ -234,6 +284,52 @@ test('content analysis is materialized from per-file contributions without a sec
   assert.deepEqual(warm.contentAnalysis, warmFull.contentAnalysis);
 });
 
+test('cross-file tool results retain global tool and Skill preamble attribution', async () => {
+  const previousNow = Date.now;
+  Date.now = () => Date.parse('2026-09-10T12:00:00.000Z');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ccu-claude-content-cross-file-tools-'));
+  roots.push(root);
+  const project = path.join(root, 'projects', '-fixture-cross-file-tools');
+  await mkdir(project, { recursive: true });
+  try {
+    await writeFile(path.join(project, 'uses.jsonl'), `${analysisBlocksLine(
+      'cross-file-tool-uses',
+      'assistant',
+      [
+        { type: 'tool_use', id: 'cross-file-read', name: 'Read', input: { file_path: '/tmp/a' } },
+        { type: 'tool_use', id: 'cross-file-skill', name: 'Skill', input: { skill: 'audit-skill' } },
+      ],
+      '2026-09-10T09:00:00.000Z',
+    )}\n`, 'utf8');
+    await writeFile(path.join(project, 'results.jsonl'), `${analysisBlocksLine(
+      'cross-file-tool-results',
+      'user',
+      [
+        { type: 'tool_result', tool_use_id: 'cross-file-read', content: 'read payload across files' },
+        { type: 'tool_result', tool_use_id: 'cross-file-skill', content: 'skill preamble across files' },
+      ],
+      '2026-09-10T10:00:00.000Z',
+    )}\n`, 'utf8');
+
+    const incremental = await updateClaudeUsageIndex(createClaudeUsageIndex(), root);
+    const full = await ClaudeDataLoader.loadUsageRecords(root, { analyzeContent: true });
+
+    assert.deepEqual(incremental.contentAnalysis, full.contentAnalysis);
+    assert.equal(
+      incremental.contentAnalysis?.toolResultBreakdown.find((slice) => slice.key === 'Read')?.count,
+      1,
+    );
+    assert.ok((incremental.contentAnalysis?.skillUses[0]?.estTokens ?? 0) > 0);
+    assert.equal(
+      incremental.contentAnalysis?.frameworkOverhead?.components
+        .find((component) => component.kind === 'skill-preamble')?.count,
+      1,
+    );
+  } finally {
+    Date.now = previousNow;
+  }
+});
+
 test('append calibration updates one canonical response instead of summing its snapshots', async () => {
   const previousNow = Date.now;
   Date.now = () => Date.parse('2026-09-10T12:00:00.000Z');
@@ -264,6 +360,63 @@ test('append calibration updates one canonical response instead of summing its s
       realInputSideTokens: 22,
     });
     assert.deepEqual(warm.contentAnalysis, full.contentAnalysis);
+  } finally {
+    Date.now = previousNow;
+  }
+});
+
+test('calibration follows missing request IDs, a cross-file winner, and cutoff expiry', async () => {
+  const previousNow = Date.now;
+  let now = Date.parse('2026-09-10T12:00:00.000Z');
+  Date.now = () => now;
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ccu-claude-content-calibration-global-'));
+  roots.push(root);
+  const project = path.join(root, 'projects', '-fixture-content-calibration-global');
+  await mkdir(project, { recursive: true });
+  const earlier = path.join(project, 'earlier.jsonl');
+  const later = path.join(project, 'later.jsonl');
+  try {
+    await writeFile(earlier, `${usageLine('missing-request', 10, 2, {
+      timestamp: '2026-09-09T12:00:30.000Z',
+      messageId: 'calibration-global-message',
+      requestId: null,
+    })}\n`, 'utf8');
+    await writeFile(later, `${usageLine('known-request', 20, 4, {
+      timestamp: '2026-09-09T12:00:40.000Z',
+      messageId: 'calibration-global-message',
+      requestId: 'calibration-global-request',
+    })}\n`, 'utf8');
+    const cold = await updateClaudeUsageIndex(createClaudeUsageIndex(), root, { windowDays: 1 });
+    assert.deepEqual(cold.contentAnalysis?.calibration, {
+      realOutputTokens: 4,
+      realInputSideTokens: 22,
+    });
+
+    await appendFile(earlier, `${usageLine('cross-file-winner', 30, 6, {
+      timestamp: '2026-09-09T12:00:50.000Z',
+      messageId: 'calibration-global-message',
+      requestId: 'calibration-global-request',
+    })}\n`, 'utf8');
+    const warm = await updateClaudeUsageIndex(cold.index, root, { windowDays: 1 });
+    const warmFull = await ClaudeDataLoader.loadUsageRecords(root, {
+      analyzeContent: true,
+      windowDays: 1,
+    });
+    assert.equal(warm.diagnostics.bodyReads, 1);
+    assert.deepEqual(warm.contentAnalysis?.calibration, {
+      realOutputTokens: 6,
+      realInputSideTokens: 32,
+    });
+    assert.deepEqual(warm.contentAnalysis, warmFull.contentAnalysis);
+
+    now = Date.parse('2026-09-10T12:01:00.000Z');
+    const expired = await updateClaudeUsageIndex(warm.index, root, { windowDays: 1 });
+    const expiredFull = await ClaudeDataLoader.loadUsageRecords(root, {
+      analyzeContent: true,
+      windowDays: 1,
+    });
+    assert.equal(expired.contentAnalysis?.calibration, undefined);
+    assert.deepEqual(expired.contentAnalysis, expiredFull.contentAnalysis);
   } finally {
     Date.now = previousNow;
   }
@@ -386,7 +539,7 @@ test('content analysis expires a completed boundary file after configured-zone m
   }
 });
 
-test('a malformed content line keeps cutoff rebasing conservative', async () => {
+test('completed malformed content lines do not poison unchanged cutoff rebases', async () => {
   const previousNow = Date.now;
   const previousTimeZone = I18n.getTimezone();
   let now = Date.parse('2026-09-10T15:59:30.000Z');
@@ -410,9 +563,13 @@ test('a malformed content line keeps cutoff rebasing conservative', async () => 
     now = Date.parse('2026-09-10T16:00:30.000Z');
     const warm = await updateClaudeUsageIndex(cold.index, root);
 
-    assert.equal(warm.diagnostics.bodyReads, 1);
-    assert.equal(warm.diagnostics.changed.rebuild, 1);
+    assert.equal(warm.diagnostics.bodyReads, 0);
+    assert.equal(warm.diagnostics.changed.rebuild, 0);
     assert.deepEqual(warm.contentAnalysis, cold.contentAnalysis);
+
+    const unchanged = await updateClaudeUsageIndex(warm.index, root);
+    assert.equal(unchanged.diagnostics.bodyReads, 0);
+    assert.deepEqual(unchanged.contentAnalysis, cold.contentAnalysis);
   } finally {
     Date.now = previousNow;
     I18n.setTimezone(previousTimeZone);
@@ -680,6 +837,86 @@ test('an append that gives a zero-timestamp file its first timestamp reorders pr
   }
 });
 
+test('a timestamp beyond a 1 MiB timestamp-less prefix retains legacy discovery order', async () => {
+  const previousNow = Date.now;
+  Date.now = () => Date.parse('2026-09-10T12:00:00.000Z');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ccu-claude-content-large-prefix-order-'));
+  roots.push(root);
+  const project = path.join(root, 'projects', '-fixture-large-prefix-order');
+  await mkdir(project, { recursive: true });
+  try {
+    const largePrefix = `${JSON.stringify({ payload: 'x'.repeat(1024 * 1024 + 32) })}\n`;
+    await writeFile(path.join(project, 'discovered-first.jsonl'), [
+      largePrefix.trimEnd(),
+      analysisTextLine(
+        'large-prefix-prompt',
+        'prompt from timestamp-limited file',
+        '2026-09-10T11:00:00.000Z',
+        'user',
+      ),
+      '',
+    ].join('\n'), 'utf8');
+    await writeFile(path.join(project, 'discovered-second.jsonl'), `${analysisTextLine(
+      'ordinary-prompt',
+      'prompt from ordinary file',
+      '2026-09-10T10:00:00.000Z',
+      'user',
+    )}\n`, 'utf8');
+
+    const incremental = await updateClaudeUsageIndex(createClaudeUsageIndex(), root);
+    const full = await ClaudeDataLoader.loadUsageRecords(root, { analyzeContent: true });
+
+    assert.deepEqual(incremental.contentAnalysis, full.contentAnalysis);
+    assert.deepEqual(
+      incremental.contentAnalysis?.recentPrompts.map((prompt) => prompt.text),
+      ['prompt from timestamp-limited file', 'prompt from ordinary file'],
+    );
+  } finally {
+    Date.now = previousNow;
+  }
+});
+
+test('changed discoveryIndex ties rebuild canonical content ownership and order', async () => {
+  const previousNow = Date.now;
+  Date.now = () => Date.parse('2026-09-10T12:00:00.000Z');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ccu-claude-content-discovery-tie-'));
+  roots.push(root);
+  const project = path.join(root, 'projects', '-fixture-discovery-tie');
+  await mkdir(project, { recursive: true });
+  const first = path.join(project, 'first.jsonl');
+  const second = path.join(project, 'second.jsonl');
+  try {
+    await writeFile(first, `${analysisTextLine(
+      'discovery-tie-owner',
+      'first discovery owner',
+      '2026-09-10T09:00:00.000Z',
+    )}\n`, 'utf8');
+    await writeFile(second, `${analysisTextLine(
+      'discovery-tie-owner',
+      'second discovery owner with different content',
+      '2026-09-10T09:00:00.000Z',
+    )}\n`, 'utf8');
+    const coldManifest = await manifestInOrder([first, second]);
+    const cold = await updateClaudeUsageIndex(createClaudeUsageIndex(), root, {
+      manifest: coldManifest,
+    });
+
+    const swappedManifest = await manifestInOrder([second, first]);
+    const warm = await updateClaudeUsageIndex(cold.index, root, {
+      manifest: swappedManifest,
+    });
+    const full = await ClaudeDataLoader.loadUsageRecords(root, {
+      analyzeContent: true,
+      manifest: swappedManifest,
+    });
+
+    assert.equal(warm.diagnostics.bodyReads, 2);
+    assert.deepEqual(warm.contentAnalysis, full.contentAnalysis);
+  } finally {
+    Date.now = previousNow;
+  }
+});
+
 test('per-file skill retention preserves the full loader global skill cap semantics', async () => {
   const previousNow = Date.now;
   let now = Date.parse('2026-09-10T12:00:00.000Z');
@@ -723,6 +960,50 @@ test('per-file skill retention preserves the full loader global skill cap semant
       1,
     );
     assert.deepEqual(aged.contentAnalysis, agedFull.contentAnalysis);
+  } finally {
+    Date.now = previousNow;
+  }
+});
+
+test('an earlier-file append displaces the exact global 5000th Skill and preamble', async () => {
+  const previousNow = Date.now;
+  Date.now = () => Date.parse('2026-09-10T12:00:00.000Z');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ccu-claude-content-skill-displacement-'));
+  roots.push(root);
+  const project = path.join(root, 'projects', '-fixture-content-skill-displacement');
+  await mkdir(project, { recursive: true });
+  const earlier = path.join(project, 'earlier.jsonl');
+  try {
+    await writeFile(
+      earlier,
+      `${skillInvocationLines('earlier-seed', 1, '2026-09-10T09:00:00.000Z').join('\n')}\n`,
+      'utf8',
+    );
+    await writeFile(
+      path.join(project, 'later.jsonl'),
+      `${skillInvocationLines('later', 5_000, '2026-09-10T10:00:00.000Z').join('\n')}\n`,
+      'utf8',
+    );
+    const cold = await updateClaudeUsageIndex(createClaudeUsageIndex(), root);
+    assert.equal(cold.contentAnalysis?.skillUses[4_999]?.name, 'later-skill-4998');
+
+    await appendFile(
+      earlier,
+      `${skillInvocationLines('earlier-tail', 1, '2026-09-10T09:01:00.000Z').join('\n')}\n`,
+      'utf8',
+    );
+    const warm = await updateClaudeUsageIndex(cold.index, root);
+    const full = await ClaudeDataLoader.loadUsageRecords(root, { analyzeContent: true });
+
+    assert.equal(warm.diagnostics.bodyReads, 1);
+    assert.equal(warm.contentAnalysis?.skillUses.length, 5_000);
+    assert.equal(warm.contentAnalysis?.skillUses[4_999]?.name, 'later-skill-4997');
+    assert.equal(
+      warm.contentAnalysis?.frameworkOverhead?.components
+        .find((component) => component.kind === 'skill-preamble')?.count,
+      5_000,
+    );
+    assert.deepEqual(warm.contentAnalysis, full.contentAnalysis);
   } finally {
     Date.now = previousNow;
   }
@@ -985,6 +1266,58 @@ test('configured timezone rebuckets Claude Today and hours from the in-memory in
   }
 });
 
+test('re-enabling analysis after a disabled DST-zone change cannot publish stale day buckets', async () => {
+  const previousNow = Date.now;
+  const previousTimeZone = I18n.getTimezone();
+  Date.now = () => Date.parse('2026-11-02T12:00:00.000Z');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ccu-claude-content-disabled-timezone-'));
+  roots.push(root);
+  const project = path.join(root, 'projects', '-fixture-disabled-timezone');
+  await mkdir(project, { recursive: true });
+  const file = path.join(project, 'timezone.jsonl');
+  try {
+    await writeFile(file, [
+      JSON.stringify({
+        type: 'assistant',
+        uuid: 'dst-thinking',
+        timestamp: '2026-11-01T06:30:00.000Z',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'thinking', thinking: 'thinking before the DST fallback' }],
+        },
+      }),
+      ...skillInvocationLines('dst-skill', 1, '2026-11-01T06:31:00.000Z'),
+      '',
+    ].join('\n'), 'utf8');
+
+    I18n.setTimezone('UTC');
+    const enabled = await updateClaudeUsageIndex(createClaudeUsageIndex(), root, {
+      analyzeContent: true,
+    });
+    assert.deepEqual(Object.keys(enabled.contentAnalysis?.thinkingByDay ?? {}), ['2026-11-01']);
+
+    I18n.setTimezone('America/Los_Angeles');
+    const disabled = await updateClaudeUsageIndex(enabled.index, root, {
+      analyzeContent: false,
+    });
+    assert.equal(disabled.diagnostics.bodyReads, 0);
+    assert.equal(disabled.contentAnalysis, null);
+
+    const reenabled = await updateClaudeUsageIndex(disabled.index, root, {
+      analyzeContent: true,
+    });
+    const full = await ClaudeDataLoader.loadUsageRecords(root, { analyzeContent: true });
+
+    assert.equal(reenabled.diagnostics.bodyReads, 1);
+    assert.deepEqual(Object.keys(reenabled.contentAnalysis?.thinkingByDay ?? {}), ['2026-10-31']);
+    assert.deepEqual(reenabled.contentAnalysis?.skillUses.map((use) => use.day), ['2026-10-31']);
+    assert.deepEqual(reenabled.contentAnalysis, full.contentAnalysis);
+  } finally {
+    Date.now = previousNow;
+    I18n.setTimezone(previousTimeZone);
+  }
+});
+
 test('nested Claude subagent logs feed Today and rolling 30 days exactly once', async () => {
   const previousTimeZone = I18n.getTimezone();
   const root = await mkdtemp(path.join(os.tmpdir(), 'ccu-claude-subagent-index-'));
@@ -1102,6 +1435,56 @@ test('append reads only the verified tail and preserves exact totals', async () 
   await assertMatchesFull(root, warm.records);
 });
 
+test('an early append performs UUID ownership lookups by touched UUID, not later-file count', async () => {
+  const previousNow = Date.now;
+  Date.now = () => Date.parse('2026-09-10T12:00:00.000Z');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ccu-claude-content-uuid-lookup-scale-'));
+  roots.push(root);
+  const project = path.join(root, 'projects', '-fixture-content-uuid-lookup-scale');
+  await mkdir(project, { recursive: true });
+  const files: string[] = [];
+  try {
+    for (let index = 0; index < 128; index += 1) {
+      const file = path.join(project, `session-${String(index).padStart(3, '0')}.jsonl`);
+      files.push(file);
+      await writeFile(file, `${analysisTextLine(
+        `uuid-lookup-${index}`,
+        `content ${index}`,
+        new Date(Date.parse('2026-09-10T08:00:00.000Z') + index * 1_000).toISOString(),
+      )}\n`, 'utf8');
+    }
+    const cold = await updateClaudeUsageIndex(createClaudeUsageIndex(), root);
+    let laterFileUuidSetReads = 0;
+    for (const file of cold.index.files.values()) {
+      if (file.path === files[0]) continue;
+      const uuids = file.analysisAllUuids;
+      Object.defineProperty(file, 'analysisAllUuids', {
+        configurable: true,
+        get: () => {
+          laterFileUuidSetReads += 1;
+          return uuids;
+        },
+      });
+    }
+
+    const tail = `${analysisTextLine(
+      'uuid-lookup-new-tail',
+      'new early-file content',
+      '2026-09-10T08:05:00.000Z',
+    )}\n`;
+    await appendFile(files[0], tail, 'utf8');
+    const warm = await updateClaudeUsageIndex(cold.index, root);
+    const full = await ClaudeDataLoader.loadUsageRecords(root, { analyzeContent: true });
+
+    assert.equal(warm.diagnostics.bodyReads, 1);
+    assert.equal(warm.diagnostics.bytesRead, Buffer.byteLength(tail));
+    assert.equal(laterFileUuidSetReads, 0);
+    assert.deepEqual(warm.contentAnalysis, full.contentAnalysis);
+  } finally {
+    Date.now = previousNow;
+  }
+});
+
 test('a successful append publishes a new snapshot without mutating the prior one', async () => {
   const { root, first } = await fixture();
   const cold = await updateClaudeUsageIndex(createClaudeUsageIndex(), root, {
@@ -1121,24 +1504,108 @@ test('a successful append publishes a new snapshot without mutating the prior on
   assert.ok(warm.records.some((record) => record._sessionTitle === 'Updated title'));
 });
 
-test('incomplete tails stay invisible until their newline is durable', async () => {
+test('content-analysis publication is deeply immutable across a successful append', async () => {
+  const previousNow = Date.now;
+  Date.now = () => Date.parse('2026-09-10T12:00:00.000Z');
+  const { root, first } = await fixture();
+  try {
+    await appendFile(first, `${skillInvocationLines(
+      'immutable',
+      1,
+      '2026-09-10T09:00:00.000Z',
+    ).join('\n')}\n`, 'utf8');
+    const cold = await updateClaudeUsageIndex(createClaudeUsageIndex(), root);
+    const priorAnalysis = stableValue(cold.contentAnalysis);
+    const priorFileAnalysis = [...cold.index.files.values()].map((file) => ({
+      path: file.path,
+      analysis: stableValue(file.analysis && {
+        cat: file.analysis.cat,
+        tools: file.analysis.tools,
+        prompts: file.analysis.prompts,
+        thinkingBySession: file.analysis.thinkingBySession,
+        thinkingByDay: file.analysis.thinkingByDay,
+        skillUses: file.analysis.skillUses,
+        skillPreambleCounts: file.analysis.skillPreambleCounts,
+        frameworkOverhead: file.analysis.frameworkOverhead,
+      }),
+      uuids: [...file.analysisAllUuids],
+    }));
+    deepFreeze(cold.contentAnalysis);
+    for (const file of cold.index.files.values()) {
+      deepFreeze(file.analysis);
+      deepFreeze(file.analysisAllUuids);
+    }
+
+    await appendFile(first, `${analysisTextLine(
+      'immutable-tail',
+      'immutable tail content',
+      '2026-09-10T09:01:00.000Z',
+    )}\n`, 'utf8');
+    const warm = await updateClaudeUsageIndex(cold.index, root);
+
+    assert.notEqual(warm.contentAnalysis, cold.contentAnalysis);
+    assert.deepEqual(stableValue(cold.contentAnalysis), priorAnalysis);
+    assert.deepEqual(
+      [...cold.index.files.values()].map((file) => ({
+        path: file.path,
+        analysis: stableValue(file.analysis && {
+          cat: file.analysis.cat,
+          tools: file.analysis.tools,
+          prompts: file.analysis.prompts,
+          thinkingBySession: file.analysis.thinkingBySession,
+          thinkingByDay: file.analysis.thinkingByDay,
+          skillUses: file.analysis.skillUses,
+          skillPreambleCounts: file.analysis.skillPreambleCounts,
+          frameworkOverhead: file.analysis.frameworkOverhead,
+        }),
+        uuids: [...file.analysisAllUuids],
+      })),
+      priorFileAnalysis,
+    );
+  } finally {
+    Date.now = previousNow;
+  }
+});
+
+test('incomplete JSON tails stay invisible until the JSON and newline are durable', async () => {
   const { root, first } = await fixture();
   const cold = await updateClaudeUsageIndex(createClaudeUsageIndex(), root, {
     analyzeContent: false,
   });
-  const partial = usageLine('partial', 9, 6);
-  await appendFile(first, partial, 'utf8');
+  const complete = usageLine('partial', 9, 6);
+  const splitAt = complete.length - 12;
+  await appendFile(first, complete.slice(0, splitAt), 'utf8');
 
   const pending = await updateClaudeUsageIndex(cold.index, root, { analyzeContent: false });
   assert.equal(pending.diagnostics.linesParsed, 0);
   assert.deepEqual(normalized(pending.records), normalized(cold.records));
 
-  await appendFile(first, '\n', 'utf8');
+  await appendFile(first, `${complete.slice(splitAt)}\n`, 'utf8');
   const completed = await updateClaudeUsageIndex(pending.index, root, {
     analyzeContent: false,
   });
   assert.equal(completed.diagnostics.linesParsed, 1);
   await assertMatchesFull(root, completed.records);
+});
+
+test('valid JSON at EOF without a newline matches the legacy full scan', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ccu-claude-valid-eof-'));
+  roots.push(root);
+  const project = path.join(root, 'projects', '-fixture-valid-eof');
+  await mkdir(project, { recursive: true });
+  await writeFile(path.join(project, 'session.jsonl'), usageLine('valid-eof', 17, 5), 'utf8');
+
+  const cold = await updateClaudeUsageIndex(createClaudeUsageIndex(), root, {
+    analyzeContent: false,
+  });
+  assert.equal(cold.diagnostics.linesParsed, 1);
+  await assertMatchesFull(root, cold.records);
+
+  const unchanged = await updateClaudeUsageIndex(cold.index, root, {
+    analyzeContent: false,
+  });
+  assert.equal(unchanged.diagnostics.bodyReads, 0);
+  await assertMatchesFull(root, unchanged.records);
 });
 
 test('request-id cardinality changes re-resolve only the affected message identity', async () => {
@@ -1216,6 +1683,45 @@ test('a failed body read keeps the previous index and visible snapshot atomic', 
   assert.equal(failed.index, cold.index);
   assert.deepEqual(normalized(failed.records), normalized(cold.records));
   assert.equal(failed.diagnostics.filesFailed, 1);
+});
+
+test('a later read failure rolls back an already parsed plan without deep mutation', async () => {
+  const { root, first, second } = await fixture();
+  const cold = await updateClaudeUsageIndex(createClaudeUsageIndex(), root, {
+    analyzeContent: false,
+  });
+  const priorRecords = normalized(cold.records);
+  const priorAllTime = stableValue(cold.index.aggregates.allTime);
+  const priorFiles = [...cold.index.files.values()].map((file) => ({
+    path: file.path,
+    size: file.fingerprint.size,
+    usage: normalized([...file.usage.values()].map((entry) => entry.record)),
+  }));
+  for (const bucket of cold.index.aggregates.byDay.values()) deepFreeze(bucket);
+  for (const file of cold.index.files.values()) {
+    deepFreeze(file.usage);
+    deepFreeze(file.prompts);
+  }
+
+  await appendFile(first, `${usageLine('rollback-first', 50, 5)}\n`, 'utf8');
+  await appendFile(second, `${usageLine('rollback-second', 60, 6)}\n`, 'utf8');
+  const failed = await updateClaudeUsageIndex(cold.index, root, {
+    analyzeContent: false,
+    beforeBodyReads: async () => unlink(second),
+  });
+
+  assert.equal(failed.index, cold.index);
+  assert.equal(failed.diagnostics.bodyReads, 2, 'the first plan parsed before the second failed');
+  assert.deepEqual(normalized(failed.records), priorRecords);
+  assert.deepEqual(stableValue(cold.index.aggregates.allTime), priorAllTime);
+  assert.deepEqual(
+    [...cold.index.files.values()].map((file) => ({
+      path: file.path,
+      size: file.fingerprint.size,
+      usage: normalized([...file.usage.values()].map((entry) => entry.record)),
+    })),
+    priorFiles,
+  );
 });
 
 test('one append in a 100-file corpus bounds I/O, parsing, and aggregate work', async () => {
