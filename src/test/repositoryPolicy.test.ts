@@ -1555,6 +1555,21 @@ test('changelog records one v2.3.3 candidate after the released v2.3 line', () =
   assert.match(changelog, /^## \[2\.3\.2\] — 2026-09-12$/m);
   assert.match(changelog, /^## \[2\.3\.1\] — 2026-09-08$/m);
   assert.match(changelog, /^## \[2\.3\.0\] — 2026-08-28$/m);
+
+  const candidateStart = changelog.indexOf('## [2.3.3]');
+  const releasedStart = changelog.indexOf('## [2.3.2]');
+  const previousReleaseStart = changelog.indexOf('## [2.3.1]');
+  const candidateSection = changelog.slice(candidateStart, releasedStart);
+  const releasedSection = changelog.slice(releasedStart, previousReleaseStart);
+  for (const candidateFix of [
+    'Bounded Codex project aggregation',
+    'Quota status contract',
+    'Claude calendar rollover',
+    'Bounded credentials-watcher recovery',
+  ]) {
+    assert.match(candidateSection, new RegExp(candidateFix));
+    assert.doesNotMatch(releasedSection, new RegExp(candidateFix));
+  }
 });
 
 test('release announcements are exact-version and user-disableable', () => {

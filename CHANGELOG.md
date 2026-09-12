@@ -26,6 +26,20 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
 - **Stable unchanged Compare refreshes** — the displayed update time now follows
   the stable rendered data snapshot. An unchanged Compare refresh remains
   byte-identical and no longer forces a complete Webview document replacement.
+- **Bounded Codex project aggregation** — project previews now index sorted
+  thread rows once instead of rescanning every thread for every project, and
+  last-activity maxima no longer expand history into function arguments.
+- **Quota status contract** — disabling quota tracking hides both Claude and
+  Codex quota status items while preserving the all-off dashboard entry icon.
+- **Claude calendar rollover** — unchanged histories now republish Today and
+  the rolling 30-day snapshot at configured-timezone midnight without
+  rereading JSONL bodies.
+- **Bounded credentials-watcher recovery** — asynchronous failures from the
+  Claude credentials-directory watcher now use the same capped exponential
+  re-arm path as the provider log watchers while polling remains available.
+  Anonymous refresh diagnostics count unnamed quota-watcher events, and Codex
+  index diagnostics now identify their trigger, watcher/debounce counts, and
+  actual backfill/worker mode without paths, filenames, or account data.
 
 ## [2.3.2] — 2026-09-12
 
@@ -71,20 +85,6 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
   displays `—`.
 
 ### Fixed
-- **Bounded Codex project aggregation** — project previews now index sorted
-  thread rows once instead of rescanning every thread for every project, and
-  last-activity maxima no longer expand history into function arguments.
-- **Quota status contract** — disabling quota tracking hides both Claude and
-  Codex quota status items while preserving the all-off dashboard entry icon.
-- **Claude calendar rollover** — unchanged histories now republish Today and
-  the rolling 30-day snapshot at configured-timezone midnight without
-  rereading JSONL bodies.
-- **Bounded credentials-watcher recovery** — asynchronous failures from the
-  Claude credentials-directory watcher now use the same capped exponential
-  re-arm path as the provider log watchers while polling remains available.
-  Anonymous refresh diagnostics count unnamed quota-watcher events, and Codex
-  index diagnostics now identify their trigger, watcher/debounce counts, and
-  actual backfill/worker mode without paths, filenames, or account data.
 - **Resilient provider watchers** — failed Claude or Codex watchers re-arm with
   bounded exponential backoff while polling remains available; recovery and
   disposal cannot create a retry hot loop.
