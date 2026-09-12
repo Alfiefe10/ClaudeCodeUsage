@@ -43,6 +43,12 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
   Anonymous refresh diagnostics count unnamed quota-watcher events, and Codex
   index diagnostics now identify their trigger, watcher/debounce counts, and
   actual backfill/worker mode without paths, filenames, or account data.
+- **Bounded Claude content-analysis refreshes** — same-day appends now update
+  the materialized analysis and calibration from only the changed file tail and
+  affected response identities. The rolling window advances at configured-zone
+  midnight; completed files can age out from timestamp metadata with zero JSONL
+  reads, while only boundary-straddling or legacy contributions require a
+  bounded rebuild.
 
 ## [2.3.2] — 2026-09-12
 

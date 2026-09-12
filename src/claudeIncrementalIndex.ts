@@ -2020,16 +2020,10 @@ export async function updateClaudeUsageIndex(
     }
   }
 
-  const previousAnalysisOrder = previousAnalysisRuntime?.orderedFileIds ?? [];
-  const actualPreviousAnalysisOrder = previousAnalysisRuntime
-    ? analysisFilesInOrder(previous).map((file) => file.fileId)
-    : [];
   const fastAppendAnalysis = Boolean(
     analyzeContent && previousAnalysisRuntime && previous.contentAnalysis &&
     previousAnalysisRuntime.asOfDay === analysisAsOfDay &&
     previousAnalysisRuntime.cutoffMs === analysisCutoffMs &&
-    previousAnalysisRuntime.orderedFileIds.length === actualPreviousAnalysisOrder.length &&
-    previousAnalysisOrder.every((fileId, index) => fileId === actualPreviousAnalysisOrder[index]) &&
     analysisRebases.size === 0 && deletions.length === 0 && moves.length === 0 &&
     plans.every((plan) => plan.kind === 'append' && Boolean(plan.prior)),
   );

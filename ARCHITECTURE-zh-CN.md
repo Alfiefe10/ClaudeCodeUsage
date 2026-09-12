@@ -214,13 +214,22 @@ dashboard 不再因此一直标为「仍在索引」。
 Claude polling 始终遵守 `refreshInterval`，file watcher 使用配置的 quiet debounce。
 生产 Claude 路径维护内存 per-file 索引：unchanged refresh 的 JSONL body read 为 0，
 append 只读已验证 tail，truncate/replace/move/delete 只重建受影响文件和 aggregate group。
-内容分析 contribution 与既有跨文件 response-identity 规则通过同一原子路径更新。新的
-Extension Host 会执行一次冷内存建索引；watcher 驱动的刷新不会重读、重聚合整个语料。
-Codex 使用独立 quiet debounce（默认 30 秒，可选 Off/10/30/60/120/300）。
+内容分析 contribution 与既有跨文件 response-identity 规则通过同一原子路径更新。内容分析维护
+process-local 的已物化 accumulator：同一自然日的普通 append 只应用变化文件的 delta，并只校准
+受影响的 canonical response identity。重复 UUID 查询最多经过 64 个 immutable layer；偶发的
+O(U) 压实替代了每次 append 都重建完整 UUID set。配置时区跨过午夜时，rolling cutoff 才推进。
+可由时间范围元数据证明“整文件保留”或“整文件过期”的 contribution 无需读取正文即可 rebase；
+只有横跨 cutoff 的文件、缺少完整范围元数据的旧 contribution、显式时区变化，以及普通的文件
+rebuild/delete 才进入慢路径。慢路径的内存复杂度为 O(F + A + R)（文件、保留的分析状态和校准
+record），只读取受影响文件正文；冷启动或迁移无法避免该路径，而未变化语料每个本地自然日最多
+执行一次。公开结果仍按既有 contract 物化 records array，但内容校准不再额外生成第二份全量
+record 副本。新的 Extension Host 会执行一次冷内存建索引；watcher 驱动的刷新不会重读、重聚合
+整个语料。Codex 使用独立 quiet debounce（默认 30 秒，可选 Off/10/30/60/120/300）。
 Claude log、Codex log 与 Claude credentials directory watcher 都只作为 `fs.watch` 加速路径：
 异步 watcher error 会关闭受影响 handle，并在 polling 继续可用时按有上限的指数退避重新挂载。
-只有 credentials watcher 接受操作系统省略 filename 的事件，因为这可能表示 credential file
-被原子替换；该类事件仅以匿名计数进入诊断。
+如果失败的 credentials watcher 重试时 profile directory 暂时不存在，同一有界链只会在窗口聚焦且
+额度跟踪仍启用时继续；目录重建后只恢复一个 watcher。只有 credentials watcher 接受操作系统省略
+filename 的事件，因为这可能表示 credential file 被原子替换；该类事件仅以匿名计数进入诊断。
 
 Codex 按多 GiB 本地历史设计：
 

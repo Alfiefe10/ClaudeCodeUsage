@@ -278,9 +278,23 @@ per-file index: unchanged refreshes read zero JSONL bodies, appends read only a
 verified tail, and truncate/replace/move/delete changes rebuild only affected
 files and aggregate groups. Content-analysis contributions and the established
 cross-file response-identity rules are updated through the same atomic path.
-A new Extension Host performs one cold in-memory build; watcher-driven refreshes
-do not reread and reaggregate the complete corpus. Codex uses its own quiet
-debounce (default 30 seconds, configurable to Off/10/30/60/120/300).
+Content analysis keeps a process-local materialized accumulator: an ordinary
+same-day append applies only the changed file delta and recalibrates only the
+affected canonical response identities. Duplicate UUID lookups use at most 64
+immutable layers; an occasional O(U) compaction replaces rebuilding the full
+UUID set on every append. At configured-zone midnight the rolling cutoff moves.
+Whole files known to be entirely retained or expired are rebased from timestamp
+metadata with no body read; only cutoff-straddling files, legacy contributions
+without complete range metadata, explicit timezone changes, and ordinary file
+rebuild/delete cases take the slow path. That path is O(F + A + R) in memory
+(files, retained analysis state, and calibration records) and reads only the
+affected file bodies; it is unavoidable for a cold build or migration and runs
+at most once per local day for an unchanged corpus. The public result still
+materializes its established records array, but content calibration no longer
+creates a second all-record copy. A new Extension Host performs one cold
+in-memory build; watcher-driven refreshes do not reread and reaggregate the
+complete corpus. Codex uses its own quiet debounce (default 30 seconds,
+configurable to Off/10/30/60/120/300).
 Claude log, Codex log, and Claude credentials-directory watchers all treat
 `fs.watch` as an acceleration path: asynchronous watcher errors close the
 affected handle and use capped exponential re-arming while polling remains the
