@@ -1566,6 +1566,7 @@ test('changelog preserves v2.3 release order and keeps named candidate fixes out
     'Quota status contract',
     'Claude calendar rollover',
     'Bounded credentials-watcher recovery',
+    'Exact bounded Claude content analysis',
   ]) {
     assert.match(candidateSection, new RegExp(candidateFix));
     assert.doesNotMatch(releasedSection, new RegExp(candidateFix));

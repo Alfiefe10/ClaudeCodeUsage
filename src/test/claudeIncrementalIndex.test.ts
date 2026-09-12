@@ -1326,15 +1326,39 @@ test('re-enabling analysis after a disabled DST-zone change cannot publish stale
     assert.equal(disabled.diagnostics.bodyReads, 0);
     assert.equal(disabled.contentAnalysis, null);
 
-    const reenabled = await updateClaudeUsageIndex(disabled.index, root, {
+    const pendingLine = analysisTextLine(
+      'dst-pending-output',
+      'output completed after analysis is re-enabled',
+      '2026-11-02T07:00:00.000Z',
+    );
+    const splitAt = pendingLine.length - 3;
+    await appendFile(file, pendingLine.slice(0, splitAt), 'utf8');
+    const disabledWithPendingTail = await updateClaudeUsageIndex(disabled.index, root, {
+      analyzeContent: false,
+    });
+    assert.equal(disabledWithPendingTail.contentAnalysis, null);
+
+    const reenabled = await updateClaudeUsageIndex(disabledWithPendingTail.index, root, {
       analyzeContent: true,
     });
-    const full = await ClaudeDataLoader.loadUsageRecords(root, { analyzeContent: true });
 
     assert.equal(reenabled.diagnostics.bodyReads, 1);
     assert.deepEqual(Object.keys(reenabled.contentAnalysis?.thinkingByDay ?? {}), ['2026-10-31']);
     assert.deepEqual(reenabled.contentAnalysis?.skillUses.map((use) => use.day), ['2026-10-31']);
-    assert.deepEqual(reenabled.contentAnalysis, full.contentAnalysis);
+    assert.equal(
+      reenabled.contentAnalysis?.totalEstimatedTokens,
+      enabled.contentAnalysis?.totalEstimatedTokens,
+      'the incomplete append must stay behind the safe cursor during re-enable',
+    );
+
+    await appendFile(file, `${pendingLine.slice(splitAt)}\n`, 'utf8');
+    const completed = await updateClaudeUsageIndex(reenabled.index, root, {
+      analyzeContent: true,
+    });
+    const fullAfterCompletion = await ClaudeDataLoader.loadUsageRecords(root, {
+      analyzeContent: true,
+    });
+    assert.deepEqual(completed.contentAnalysis, fullAfterCompletion.contentAnalysis);
   } finally {
     Date.now = previousNow;
     I18n.setTimezone(previousTimeZone);
