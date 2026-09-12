@@ -13,6 +13,7 @@ import { buildCodexInsights } from '../providers/codex/codexInsights';
 import {
   anonymousRootNamedChildProjectFixture,
   codexFixtureIdentityKey,
+  highCardinalityProjectSnapshotFixture,
   identityLineageFixture,
   parentlessNonRootTitleFixture,
   rootedTaskBeyondRecentRowCapFixture,
@@ -1310,4 +1311,53 @@ test('a parentless non-root cannot supply the task title', () => {
   assert.equal(view.lastTaskIdentity?.title, undefined);
   assert.match(view.lastTaskIdentity?.taskKey ?? '', /^[a-f0-9]{16}$/);
   assert.doesNotMatch(JSON.stringify(view.lastTaskIdentity), /session:|project:/);
+});
+
+test('high-cardinality project aggregation stays linear and avoids variadic array spreads', () => {
+  const projectCount = 256;
+  const snapshot = highCardinalityProjectSnapshotFixture(projectCount);
+  const originalFilter = Array.prototype.filter;
+  const originalMax = Math.max;
+  let fullCardinalityFilterCalls = 0;
+  let largestMaxArgumentCount = 0;
+
+  (Array.prototype as any).filter = function (
+    this: unknown[],
+    ...args: unknown[]
+  ): unknown[] {
+    if (this.length === projectCount) {
+      fullCardinalityFilterCalls += 1;
+    }
+    return Reflect.apply(originalFilter, this, args);
+  };
+  Math.max = (...values: number[]): number => {
+    largestMaxArgumentCount = originalMax(
+      largestMaxArgumentCount,
+      values.length,
+    );
+    return originalMax(...values);
+  };
+
+  let view: ReturnType<typeof buildCodexUsageView>;
+  try {
+    view = buildCodexUsageView(snapshot, NOW);
+  } finally {
+    Array.prototype.filter = originalFilter;
+    Math.max = originalMax;
+  }
+
+  assert.equal(view.projects.length, projectCount);
+  assert.equal(view.totalThreadCount, projectCount);
+  assert.equal(
+    view.projects.reduce((total, project) => total + project.threadCount, 0),
+    projectCount,
+  );
+  assert.ok(
+    largestMaxArgumentCount <= 16,
+    `expected fixed-arity maxima, observed ${largestMaxArgumentCount} arguments`,
+  );
+  assert.ok(
+    fullCardinalityFilterCalls < 64,
+    `expected bounded full-array filtering, observed ${fullCardinalityFilterCalls} calls`,
+  );
 });

@@ -223,6 +223,7 @@ export interface CodexUsageView {
 // directly instead of rescanning source logs or creating a second cache.
 const MAX_DAILY_ROWS = 370;
 const MAX_RECENT_THREAD_ROWS = 1_000;
+const MAX_PROJECT_RECENT_THREADS = 20;
 const HIGH_EFFORTS = new Set(['high', 'xhigh', 'max', 'ultra']);
 
 function zeroTokens(): ProviderTokenCounts {
@@ -565,6 +566,14 @@ function scopeFromPeriodDays(
 
 function observedAt(file: CodexFileAggregate): number {
   return file.session.endedAt ?? file.session.startedAt ?? 0;
+}
+
+function latestObservedAt(files: readonly CodexFileAggregate[]): number {
+  let latest = Number.NEGATIVE_INFINITY;
+  for (const file of files) {
+    latest = Math.max(latest, observedAt(file));
+  }
+  return latest;
 }
 
 function sortedBucketKeys(
@@ -1056,6 +1065,14 @@ export function buildCodexUsageView(
     periodContext,
     Number.POSITIVE_INFINITY,
   );
+  const recentThreadsByProject = new Map<string, CodexThreadUsageView[]>();
+  for (const thread of allThreadRows) {
+    const rows = recentThreadsByProject.get(thread.projectKey) ?? [];
+    if (rows.length < MAX_PROJECT_RECENT_THREADS) {
+      rows.push(thread);
+      recentThreadsByProject.set(thread.projectKey, rows);
+    }
+  }
   const projects = new Map<PseudonymousIdentityKey, CodexFileAggregate[]>();
   for (const file of snapshot.files) {
     const key = projectIdentityKey(file);
@@ -1144,7 +1161,7 @@ export function buildCodexUsageView(
       ? [snapshot.limit]
       : [];
   const limits = buildCodexLimitViews(sourceLimits, now);
-  const lastActiveAt = recent.length > 0 ? Math.max(...recent.map(observedAt)) : 0;
+  const lastActiveAt = recent.length > 0 ? latestObservedAt(recent) : 0;
   const recentProjectIdentityKey = taskIdentityFile
     ? projectIdentityKey(taskIdentityFile)
     : NEUTRAL_CODEX_PROJECT_KEY;
@@ -1207,11 +1224,9 @@ export function buildCodexUsageView(
           projectKey,
           name: identityValue(files, 'projectName'),
           directoryName: identityValue(files, 'projectDirectoryName'),
-          lastActiveAt: Math.max(0, ...files.map(observedAt)),
+          lastActiveAt: Math.max(0, latestObservedAt(files)),
           threadCount: files.length,
-          recentThreads: allThreadRows
-            .filter((thread) => thread.projectKey === projectKey)
-            .slice(0, 20),
+          recentThreads: recentThreadsByProject.get(projectKey) ?? [],
           scope: scope(files, aggregateIndexIncomplete),
         };
       })
