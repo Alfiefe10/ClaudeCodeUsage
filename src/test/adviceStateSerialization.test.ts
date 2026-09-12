@@ -136,6 +136,32 @@ test('live dashboard patches expose only host-current sealed preview IDs', async
   assert.deepEqual(pendingConsentPatch.adviceSnapshotIds, {});
   provider.adviceConsentWritesPending = 0;
 
+  const stored = provider.preparedAdviceSnapshots.get(snapshotId);
+  assert.ok(stored);
+  const duplicateSnapshotId = 'snapshot-111111111111111111111111';
+  provider.preparedAdviceSnapshots.set(duplicateSnapshotId, stored);
+  const ambiguousPatch = provider.dashboardLivePatchFor(documentHtml);
+  assert.ok(ambiguousPatch);
+  assert.deepEqual(ambiguousPatch.adviceSnapshotIds, {});
+  provider.preparedAdviceSnapshots.delete(duplicateSnapshotId);
+
+  const originalState = provider.adviceEffectivenessStates.claude;
+  assert.ok(originalState);
+  provider.adviceEffectivenessStates = {
+    claude: {
+      ...originalState,
+      contract: {
+        ...originalState.contract,
+        observations: originalState.contract.observations.map((observation: any, index: number) =>
+          index === 0 ? { ...observation, value: Number(observation.value) + 1 } : observation),
+      },
+    },
+  };
+  const changedSourcePatch = provider.dashboardLivePatchFor(documentHtml);
+  assert.ok(changedSourcePatch);
+  assert.deepEqual(changedSourcePatch.adviceSnapshotIds, {});
+  provider.adviceEffectivenessStates = { claude: originalState };
+
   provider.adviceConsentGeneration += 1;
   const stalePatch = provider.dashboardLivePatchFor(documentHtml);
   assert.ok(stalePatch);
