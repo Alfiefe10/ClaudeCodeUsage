@@ -1549,7 +1549,7 @@ test('changelog records the V2.2.2 energy patch after the released V2.2.1 baseli
   assert.doesNotMatch(changelog, /^## \[2\.2\.[01]\] — Unreleased$/m);
 });
 
-test('changelog records one v2.3.3 candidate after the released v2.3 line', () => {
+test('changelog preserves v2.3 release order and keeps named candidate fixes out of v2.3.2', () => {
   const changelog = repoFile('CHANGELOG.md');
   assert.match(changelog, /^## \[2\.3\.3\] — Unreleased$/m);
   assert.match(changelog, /^## \[2\.3\.2\] — 2026-09-12$/m);
