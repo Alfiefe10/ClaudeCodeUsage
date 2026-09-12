@@ -298,6 +298,7 @@ interface FilePlan {
   analysisReason?: 'source' | 'cutoff' | 'ownership' | 'full';
   entry: UsageFileFingerprint;
   fileId: string;
+  orderTimestampMs?: number;
   prior?: ClaudeUsageFileContribution;
   replacedFileId?: string;
 }
@@ -1125,9 +1126,9 @@ async function parsePlan(
   analysisCutoffMs: number,
   analysisSeenUuids?: Set<string>,
 ): Promise<ParsedPlan> {
-  const rankDiscoveryIndex = plan.kind === 'append' && plan.prior
-    ? plan.prior.fingerprint.discoveryIndex
-    : plan.entry.discoveryIndex;
+  const rankDiscoveryIndex = plan.entry.discoveryIndex;
+  const priorOrderTimestampMs = plan.prior?.firstTimestampMs ?? 0;
+  const orderTimestampMs = plan.orderTimestampMs ?? priorOrderTimestampMs;
   const base = plan.kind === 'append' && plan.prior
     ? cloneFile(plan.prior, plan.entry)
     : {
@@ -1136,7 +1137,7 @@ async function parsePlan(
         fingerprint: plan.entry,
         offset: 0,
         tailSignature: '',
-        firstTimestampMs: 0,
+        firstTimestampMs: orderTimestampMs,
         recentPrompts: new Map<string, number>(),
         usage: new Map<string, IndexedRecord>(),
         prompts: new Map<string, IndexedRecord>(),
@@ -1146,6 +1147,7 @@ async function parsePlan(
         analysisOldestIncludedTimestampMs: undefined,
         analysisHasUnboundedTimestamp: false,
       };
+  base.firstTimestampMs = orderTimestampMs;
   if (!analyzeContent) base.analysis = null;
   else if (!base.analysis || base.analysis.cutoffMs !== analysisCutoffMs) {
     base.analysis = newAnalysisAcc(analysisCutoffMs, true);
@@ -1235,10 +1237,6 @@ async function parsePlan(
                 ? analysisTimestampMs
                 : Math.min(base.analysisOldestIncludedTimestampMs, analysisTimestampMs);
           }
-        }
-        if (base.firstTimestampMs === 0 && typeof parsed.timestamp === 'string') {
-          const timestampMs = Date.parse(parsed.timestamp);
-          if (Number.isFinite(timestampMs)) base.firstTimestampMs = timestampMs;
         }
         if (parsed.type === 'ai-title' && typeof parsed.aiTitle === 'string') {
           base.aiTitle = { text: parsed.aiTitle, endOffset };
@@ -1342,15 +1340,18 @@ async function parsePlan(
   base.path = plan.entry.path;
   base.tailSignature = await tailSignature(plan.entry.path, base.offset);
   if (base.analysis) base.analysis.seenUuids = ownedAnalysisUuids;
-  if (plan.kind === 'rebuild') {
-    for (const value of base.usage.values()) {
-      value.fileTimestampMs = base.firstTimestampMs;
-      value.discoveryIndex = rankDiscoveryIndex;
-    }
-    for (const value of base.prompts.values()) {
-      value.fileTimestampMs = base.firstTimestampMs;
-      value.discoveryIndex = rankDiscoveryIndex;
-    }
+  if (plan.kind === 'rebuild' || priorOrderTimestampMs !== orderTimestampMs ||
+    plan.prior?.fingerprint.discoveryIndex !== rankDiscoveryIndex) {
+    base.usage = new Map([...base.usage].map(([key, value]) => [key, {
+      ...value,
+      fileTimestampMs: base.firstTimestampMs,
+      discoveryIndex: rankDiscoveryIndex,
+    }]));
+    base.prompts = new Map([...base.prompts].map(([key, value]) => [key, {
+      ...value,
+      fileTimestampMs: base.firstTimestampMs,
+      discoveryIndex: rankDiscoveryIndex,
+    }]));
   }
   return {
     ...plan,
@@ -1744,6 +1745,23 @@ function retagMovedFile(
   next.usage = new Map([...prior.usage].map(([key, value]) => [key, retag(value)]));
   next.prompts = new Map([...prior.prompts].map(([key, value]) => [key, retag(value)]));
   return next;
+}
+
+function retagFileOrdering(
+  prior: ClaudeUsageFileContribution,
+  entry: UsageFileFingerprint,
+): ClaudeUsageFileContribution {
+  const retag = (value: IndexedRecord): IndexedRecord => ({
+    ...value,
+    fileTimestampMs: prior.firstTimestampMs,
+    discoveryIndex: entry.discoveryIndex,
+  });
+  return {
+    ...prior,
+    fingerprint: entry,
+    usage: new Map([...prior.usage].map(([key, value]) => [key, retag(value)])),
+    prompts: new Map([...prior.prompts].map(([key, value]) => [key, retag(value)])),
+  };
 }
 
 function titleForSession(index: ClaudeUsageIndex, sessionId: string): string | undefined {
@@ -2284,6 +2302,10 @@ export async function updateClaudeUsageIndex(
   const analysisRebases = new Map<string, ClaudeUsageFileContribution>();
   const analysisPayloadRebases = new Set<string>();
   const moves: Array<{ prior: ClaudeUsageFileContribution; entry: UsageFileFingerprint }> = [];
+  const metadataRetags: Array<{
+    prior: ClaudeUsageFileContribution;
+    entry: UsageFileFingerprint;
+  }> = [];
   const changed = { append: 0, rebuild: 0, move: 0, delete: 0 };
 
   for (const entry of currentEntries) {
@@ -2314,7 +2336,13 @@ export async function updateClaudeUsageIndex(
       const needsAnalysisBody = analyzeContent &&
         (timeZoneChanged || !sameIdentity.analysis ||
           (sameIdentity.analysis.cutoffMs !== analysisCutoffMs && !rebasedAnalysis));
-      if (bodyUnchanged && !needsAnalysisBody) continue;
+      if (bodyUnchanged && !needsAnalysisBody) {
+        if (sameIdentity.path === entry.path &&
+          sameIdentity.fingerprint.discoveryIndex !== entry.discoveryIndex) {
+          metadataRetags.push({ prior: sameIdentity, entry });
+        }
+        continue;
+      }
       if (needsAnalysisBody) {
         analysisRebases.delete(fileId);
         analysisPayloadRebases.delete(fileId);
@@ -2366,6 +2394,24 @@ export async function updateClaudeUsageIndex(
   }
   const deletions = [...previous.files.values()].filter((file) => !seenPrevious.has(file.fileId));
   changed.delete = deletions.length;
+  let canonicalOrderChanged = false;
+  if (metadataRetags.length > 0) {
+    const previousCanonicalOrder = previousAnalysisRuntime?.orderedFileIds ??
+      analysisFilesInOrder(previous).map((file) => file.fileId);
+    const projectedOrder = currentEntries
+      .map((entry) => ({ entry, file: previous.files.get(stableFileId(entry)) }))
+      .filter((value): value is {
+        entry: UsageFileFingerprint;
+        file: ClaudeUsageFileContribution;
+      } => Boolean(value.file))
+      .sort((left, right) =>
+        left.file.firstTimestampMs - right.file.firstTimestampMs ||
+        left.entry.discoveryIndex - right.entry.discoveryIndex)
+      .map((value) => value.file.fileId);
+    canonicalOrderChanged = projectedOrder.length === currentEntries.length &&
+      (projectedOrder.length !== previousCanonicalOrder.length ||
+        projectedOrder.some((fileId, index) => previousCanonicalOrder[index] !== fileId));
+  }
 
   const replaceWithFullAnalysisPlans = (): void => {
     plans.length = 0;
@@ -2405,7 +2451,8 @@ export async function updateClaudeUsageIndex(
       analysisCutoffMs < priorAnalysisCutoffMs;
     const unsafeSourceMutation = deletions.length > 0 || moves.length > 0 ||
       (sourcePlans.length > 0 && !safeTailAppend);
-    forcedFullAnalysisRebuild = cutoffMovedBackward || unsafeSourceMutation;
+    forcedFullAnalysisRebuild = cutoffMovedBackward || unsafeSourceMutation ||
+      canonicalOrderChanged;
     if (forcedFullAnalysisRebuild) {
       replaceWithFullAnalysisPlans();
     }
@@ -2474,6 +2521,20 @@ export async function updateClaudeUsageIndex(
     const agentTypeCache = new Map<string, string>();
     const workflowNameCache = new Map<string, string>();
     const parseSelectedPlans = async (useFastUuidLayers: boolean): Promise<void> => {
+      const orderProbePlans = plans.filter((plan) =>
+        plan.kind === 'rebuild' || (plan.prior?.firstTimestampMs ?? 0) === 0);
+      let probedOrder: Awaited<ReturnType<typeof sortUsageFilesByEarliestTimestamp>> | undefined;
+      if (orderProbePlans.length > 0) {
+        probedOrder = await sortUsageFilesByEarliestTimestamp(
+          orderProbePlans.map((plan) => plan.entry),
+        );
+        bytesRead += probedOrder.bytesRead;
+      }
+      for (const plan of plans) {
+        plan.orderTimestampMs = plan.kind === 'append' && (plan.prior?.firstTimestampMs ?? 0) > 0
+          ? plan.prior!.firstTimestampMs
+          : probedOrder?.timestampMsByPath.get(plan.entry.path) ?? 0;
+      }
       const analysisSeenUuids: Set<string> = useFastUuidLayers && previousAnalysisRuntime
         ? new LayeredAnalysisSeenUuids(
             previousAnalysisRuntime.uuidLayers,
@@ -2494,12 +2555,11 @@ export async function updateClaudeUsageIndex(
         }
         const rebuildPlans = plans.filter((plan) => plan.kind === 'rebuild');
         if (rebuildPlans.length > 0) {
-          const sorted = await sortUsageFilesByEarliestTimestamp(rebuildPlans.map((plan) => plan.entry));
-          const order = new Map(sorted.files.map((file, index) => [file, index]));
           plans.sort((left, right) => {
             if (left.kind !== right.kind) return left.kind === 'rebuild' ? -1 : 1;
             if (left.kind === 'append') return 0;
-            return (order.get(left.entry.path) ?? 0) - (order.get(right.entry.path) ?? 0);
+            return (left.orderTimestampMs ?? 0) - (right.orderTimestampMs ?? 0) ||
+              left.entry.discoveryIndex - right.entry.discoveryIndex;
           });
         }
       }
@@ -2615,6 +2675,16 @@ export async function updateClaudeUsageIndex(
 
   for (const [fileId, rebased] of analysisRebases) {
     next.files.set(fileId, rebased);
+  }
+  const plannedFileIds = new Set(plans.map((plan) => plan.fileId));
+  const movedFileIds = new Set(moves.map((move) => move.prior.fileId));
+  for (const metadata of metadataRetags) {
+    if (plannedFileIds.has(metadata.prior.fileId) || movedFileIds.has(metadata.prior.fileId)) {
+      continue;
+    }
+    const rebased = analysisRebases.get(metadata.prior.fileId) ?? metadata.prior;
+    removeFile(metadata.prior);
+    addFile(retagFileOrdering(rebased, metadata.entry));
   }
   for (const deletion of deletions) removeFile(deletion);
   for (const move of moves) {
