@@ -422,6 +422,27 @@ test('clearing local advice data cancels a preview whose digest validation is pe
   await expect(root.locator('[data-advice-action="send"]')).toBeDisabled();
 });
 
+test('host-triggered advice clear cancels a pending browser digest validation', async ({ page }) => {
+  const fixture = buildAdviceEffectivenessFixture({ locale: 'en' });
+  await openCandidate(page, 'claude');
+  await grantAggregateConsent(page);
+  await gateNextAdvicePreviewValidation(page);
+
+  const root = page.locator('[data-advice-provider="claude"]');
+  await root.locator('[data-advice-action="preview"]').click();
+  await dispatchHostMessage(page, fixture.snapshotMessages.aggregateOnly);
+  await expect.poll(() => page.evaluate(() =>
+    globalThis.__ccuAdvicePreviewValidationStarted)).toBe(true);
+
+  await dispatchHostMessage(page, { command: 'advicePreviewsInvalidated' });
+  await releaseAdvicePreviewValidation(page);
+
+  const preview = root.locator('[data-advice-preview]');
+  await expect(preview).toBeHidden();
+  await expect(preview.locator('[data-advice-preview-body]')).toHaveText('');
+  await expect(root.locator('[data-advice-action="send"]')).toBeDisabled();
+});
+
 test('a live dashboard patch preserves vertical position inside the advice payload preview', async ({ page }) => {
   const fixture = buildAdviceEffectivenessFixture({ locale: 'en' });
   const bodyText = JSON.stringify(

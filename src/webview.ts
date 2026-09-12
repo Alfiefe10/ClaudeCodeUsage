@@ -1275,7 +1275,10 @@ export class UsageWebviewProvider {
         .update(JSON.stringify(state.promptSamples.map((sample) => sample.text)), 'utf8')
         .digest('hex'),
       userContextDigest: createHash('sha256')
-        .update(state.userContext ?? '', 'utf8')
+        // JSON preserves lone surrogates. Hashing the raw UTF-8 bytes would
+        // replace them with U+FFFD and could seal two different request bodies
+        // under the same revision.
+        .update(JSON.stringify(state.userContext ?? ''), 'utf8')
         .digest('hex'),
     };
     return `advice-${createHash('sha256')
@@ -1525,6 +1528,10 @@ export class UsageWebviewProvider {
     if (!storage) {
       return false;
     }
+    // The command-palette path has no browser click that can synchronously
+    // revoke a preview. Cancel browser-side digest validation before the first
+    // durable-storage await, then perform the host-side invalidation below.
+    this.postAdviceMessage({ command: 'advicePreviewsInvalidated' });
     this.adviceLocalStateGeneration += 1;
     this.adviceConsentGeneration += 1;
     this.clearPreparedAdviceSnapshots();
@@ -12666,6 +12673,11 @@ document.addEventListener('click', function(event) {
 // Handle messages from extension
 window.addEventListener('message', async function(event) {
   const message = event.data;
+
+  if (message.command === 'advicePreviewsInvalidated') {
+    adviceInvalidateAllPreviews();
+    return;
+  }
 
   if (message.command === 'dashboardDataPatch') {
     ccuApplyDashboardDataPatch(message);

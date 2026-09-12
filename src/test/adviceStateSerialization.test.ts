@@ -207,6 +207,62 @@ test('prompt sample boundaries cannot collide in the sealed source revision', as
   assert.equal(messages[messages.length - 1]?.reason, 'stale-preview');
 });
 
+test('arbitrary user-context strings cannot collide in the sealed source revision', async () => {
+  const initial = grantedState(true);
+  const storage = new ControlledStorage(initial);
+  const { provider, messages } = await preparedProvider(storage, initial);
+  provider.currentProvider = 'claude';
+  provider.currentTab = 'content';
+  provider.hourlyDataForRolling30DaysByDay = {};
+
+  const providerState = provider.adviceEffectivenessStates.claude;
+  providerState.userContext = '\uD800';
+  provider.preparedAdviceSnapshots.clear();
+  provider.handlePrepareAdviceSnapshotMessage({
+    provider: 'claude', aggregateConsent: 'explicit', promptSampleConsent: 'explicit',
+  });
+  const surrogateSnapshotId = [...provider.preparedAdviceSnapshots.keys()][0];
+  assert.ok(surrogateSnapshotId);
+
+  // TextEncoder replaces a lone surrogate with U+FFFD, so hashing the raw
+  // string bytes alone collides even though the canonical request JSON differs.
+  providerState.userContext = '\uFFFD';
+  const documentHtml = [
+    '<!DOCTYPE html>',
+    '<!-- ccu-live-panel:start --><section>fresh</section><!-- ccu-live-panel:end -->',
+    '<script>const hours = /* ccu-live-hours:start */{}/* ccu-live-hours:end */;</script>',
+  ].join('');
+  const patch = provider.dashboardLivePatchFor(documentHtml);
+  assert.ok(patch);
+  assert.deepEqual(patch.adviceSnapshotIds, {}, 'the old context must not remain restorable');
+
+  let sends = 0;
+  provider.onSendAdviceInvocation = async () => {
+    sends += 1;
+    return { ok: false, code: 'transport-error' };
+  };
+  messages.length = 0;
+  await provider.handleSendAdviceSnapshotMessage({
+    provider: 'claude', snapshotId: surrogateSnapshotId,
+  });
+  assert.equal(sends, 0, 'the old context must not remain sendable');
+  assert.equal(messages[messages.length - 1]?.reason, 'stale-preview');
+});
+
+test('host clear invalidates browser previews before durable storage settles', async () => {
+  const initial = grantedState();
+  const storage = new ControlledStorage(initial);
+  const { provider, messages } = await preparedProvider(storage, initial);
+
+  messages.length = 0;
+  const clear = provider.clearAdviceLocalData();
+  assert.deepEqual(messages[0], { command: 'advicePreviewsInvalidated' });
+  await nextTurn();
+  assert.equal(storage.pending.length, 1);
+  storage.releaseNext();
+  await clear;
+});
+
 test('withdrawal rejects an old preview before its durable consent write completes', async () => {
   const initial = grantedState();
   const storage = new ControlledStorage(initial);
