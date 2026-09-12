@@ -215,16 +215,26 @@ Claude polling 始终遵守 `refreshInterval`，file watcher 使用配置的 qui
 生产 Claude 路径维护内存 per-file 索引：unchanged refresh 的 JSONL body read 为 0，
 append 只读已验证 tail，truncate/replace/move/delete 只重建受影响文件和 aggregate group。
 内容分析 contribution 与既有跨文件 response-identity 规则通过同一原子路径更新。内容分析维护
-process-local 的已物化 accumulator：同一自然日的普通 append 只应用变化文件的 delta，并只校准
-受影响的 canonical response identity。重复 UUID 查询最多经过 64 个 immutable layer；偶发的
-O(U) 压实替代了每次 append 都重建完整 UUID set。配置时区跨过午夜时，rolling cutoff 才推进。
-可由时间范围元数据证明“整文件保留”或“整文件过期”的 contribution 无需读取正文即可 rebase；
-只有横跨 cutoff 的文件、缺少完整范围元数据的旧 contribution、显式时区变化，以及普通的文件
-rebuild/delete 才进入慢路径。慢路径的内存复杂度为 O(F + A + R)（文件、保留的分析状态和校准
-record），只读取受影响文件正文；冷启动或迁移无法避免该路径，而未变化语料每个本地自然日最多
-执行一次。公开结果仍按既有 contract 物化 records array，但内容校准不再额外生成第二份全量
-record 副本。新的 Extension Host 会执行一次冷内存建索引；watcher 驱动的刷新不会重读、重聚合
-整个语料。Codex 使用独立 quiet debounce（默认 30 秒，可选 Off/10/30/60/120/300）。
+process-local 的已物化 accumulator，其 cutoff 与 `ClaudeDataLoader` 一样按毫秒连续滚动，而不是
+用本地午夜近似。每个文件记录“已纳入 contribution 的最早时间戳”，校准也记录最早 record，二者
+作为 frontier：cutoff 在 frontier 之间移动不会改变结果，也无需读取正文；可证明整文件保留或
+整文件过期时同样只用元数据 rebase。cutoff 跨过 frontier 时，只重读受影响的边界文件，以及
+first-owner 可能变化的 UUID claimant。
+
+普通的单文件 append 会先只读已验证 tail、应用变化文件 delta，并只重校准受影响的 canonical
+response identity。重复 UUID 查询最多经过 64 个 immutable layer；偶发的 O(U) 压实替代每次
+append 都重建完整 UUID set。若 tail 中出现的 UUID 也存在于排序更后的文件，global first-owner
+可能改变，因此丢弃 provisional tail 结果，并按 full loader 的完整文件顺序重建分析。新建/替换
+文件、多文件 append、move、delete、cutoff 向后移动，以及原本无时间戳的文件在 append 后首次
+获得时间戳，也走同一 correctness-first 有序重建。这是主动收缩优化范围，避免 fast path 与 full
+loader 产生语义差异。每文件 skill candidate 同时保留匹配 preamble 的事件计数，最终有序物化时
+才应用全局 5,000 次上限。
+
+慢物化路径的内存复杂度为 O(F + A + R)（文件、保留的分析状态和校准 record）。仅 cutoff 变化时
+只读取边界/claimant 文件；source order 变化时可能重读完整语料，以重新建立 first-owner、prompt
+顺序和 skill cap 语义。公开结果仍按既有 contract 物化 records array，但内容校准不再额外生成
+第二份全量 record 副本。新的 Extension Host 仍会执行一次冷内存建索引。Codex 使用独立 quiet
+debounce（默认 30 秒，可选 Off/10/30/60/120/300）。
 Claude log、Codex log 与 Claude credentials directory watcher 都只作为 `fs.watch` 加速路径：
 异步 watcher error 会关闭受影响 handle，并在 polling 继续可用时按有上限的指数退避重新挂载。
 如果失败的 credentials watcher 重试时 profile directory 暂时不存在，同一有界链只会在窗口聚焦且

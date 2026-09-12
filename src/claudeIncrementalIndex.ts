@@ -67,6 +67,7 @@ interface TaggedAnalysisSkillUse {
   fileId: string;
   position: number;
   value: AnalysisSkillUse;
+  preambleCount: number;
 }
 
 interface AnalysisCalibration {
@@ -87,6 +88,7 @@ interface AnalysisRuntimeState {
   promptTail: TaggedAnalysisPrompt[];
   skillHead: TaggedAnalysisSkillUse[];
   calibration: AnalysisCalibration;
+  calibrationOldestTimestampMs?: number;
   uuidLayers: ReadonlySet<string>[];
 }
 
@@ -127,6 +129,10 @@ interface ClaudeUsageFileContribution {
   analysisRangeComplete: boolean;
   analysisFirstTimestampMs?: number;
   analysisLastTimestampMs?: number;
+  /** Oldest finite timestamp that was actually admitted by the contribution's
+   * cutoff and UUID ownership state. A newer cutoff can reuse the contribution
+   * until it crosses this timestamp. */
+  analysisOldestIncludedTimestampMs?: number;
   analysisHasUnboundedTimestamp: boolean;
 }
 
@@ -267,14 +273,30 @@ export interface ClaudeUsageDashboardSnapshot extends ClaudeUsageAggregateSnapsh
 
 interface FilePlan {
   kind: 'append' | 'rebuild';
+  analysisReason?: 'source' | 'cutoff' | 'ownership' | 'full';
   entry: UsageFileFingerprint;
   fileId: string;
   prior?: ClaudeUsageFileContribution;
   replacedFileId?: string;
 }
 
+function sameAnalysisPayload(
+  left: ClaudeUsageFileContribution,
+  right: ClaudeUsageFileContribution,
+): boolean {
+  if (!left.analysis || !right.analysis) return left.analysis === right.analysis;
+  // Metadata-only cutoff rebases shallow-copy AnalysisAcc and retain every
+  // payload collection. An empty/changed contribution gets fresh collections.
+  return left.analysis.cat === right.analysis.cat &&
+    left.analysis.tools === right.analysis.tools &&
+    left.analysis.seenUuids === right.analysis.seenUuids &&
+    left.analysis.prompts === right.analysis.prompts &&
+    left.analysis.skillUses === right.analysis.skillUses;
+}
+
 interface ParsedPlan extends FilePlan {
   contribution: ClaudeUsageFileContribution;
+  analysisTouchedUuids: Set<string>;
   bytesRead: number;
   linesParsed: number;
 }
@@ -488,6 +510,7 @@ function cloneAnalysisAcc(value: AnalysisAcc): AnalysisAcc {
       Object.entries(value.thinkingByDay).map(([key, share]) => [key, { ...share }]),
     ),
     skillUses: value.skillUses.map((use) => ({ ...use })),
+    skillPreambleCounts: [...value.skillPreambleCounts],
     skillByToolId: { ...value.skillByToolId },
     frameworkOverhead: Object.fromEntries(
       Object.entries(value.frameworkOverhead).map(([key, bucket]) => [key, { ...bucket }]),
@@ -553,14 +576,23 @@ function calibrationContribution(
 function calibrationFromRecords(
   records: Iterable<ClaudeUsageRecord>,
   cutoffMs: number,
-): AnalysisCalibration {
+): { calibration: AnalysisCalibration; oldestTimestampMs?: number } {
   const calibration = { realOutputTokens: 0, realInputSideTokens: 0 };
+  let oldestTimestampMs: number | undefined;
   for (const record of records) {
     const contribution = calibrationContribution(record, cutoffMs);
     calibration.realOutputTokens += contribution.realOutputTokens;
     calibration.realInputSideTokens += contribution.realInputSideTokens;
+    if (contribution.realOutputTokens > 0 || contribution.realInputSideTokens > 0) {
+      const timestampMs = Date.parse(record.timestamp);
+      if (Number.isFinite(timestampMs)) {
+        oldestTimestampMs = oldestTimestampMs === undefined
+          ? timestampMs
+          : Math.min(oldestTimestampMs, timestampMs);
+      }
+    }
   }
-  return calibration;
+  return { calibration, oldestTimestampMs };
 }
 
 function finalizeMaterializedAnalysis(state: AnalysisRuntimeState): ContentAnalysis {
@@ -599,14 +631,20 @@ function buildAnalysisRuntimeState(
     if (skillHead.length < ANALYSIS_SKILL_USE_LIMIT) {
       for (const [position, value] of file.analysis.skillUses.entries()) {
         if (skillHead.length >= ANALYSIS_SKILL_USE_LIMIT) break;
-        skillHead.push({ fileId: file.fileId, position, value: { ...value } });
+        skillHead.push({
+          fileId: file.fileId,
+          position,
+          value: { ...value },
+          preambleCount: file.analysis.skillPreambleCounts[position] ?? 0,
+        });
       }
     }
     for (const uuid of file.analysis.seenUuids) seenUuids.add(uuid);
   }
   merged.seenUuids = new Set<string>();
   merged.prompts = promptTail.map((entry) => ({ ...entry.value }));
-  merged.skillUses = skillHead.map((entry) => ({ ...entry.value }));
+  applySkillHead(merged, skillHead);
+  const calibrationState = calibrationFromRecords(index.visibleRecords.values(), cutoffMs);
   return {
     asOfDay,
     cutoffMs,
@@ -614,7 +652,8 @@ function buildAnalysisRuntimeState(
     merged,
     promptTail,
     skillHead,
-    calibration: calibrationFromRecords(index.visibleRecords.values(), cutoffMs),
+    calibration: calibrationState.calibration,
+    calibrationOldestTimestampMs: calibrationState.oldestTimestampMs,
     uuidLayers: [seenUuids],
   };
 }
@@ -659,6 +698,7 @@ function addFrameworkDelta(
   after: AnalysisAcc['frameworkOverhead'],
 ): void {
   for (const key of new Set([...Object.keys(before), ...Object.keys(after)]) as Set<keyof typeof target>) {
+    if (key === 'skill-preamble') continue;
     const prior = before[key] ?? { tokens: 0, count: 0 };
     const next = after[key] ?? { tokens: 0, count: 0 };
     const current = target[key] ?? { tokens: 0, count: 0 };
@@ -666,6 +706,22 @@ function addFrameworkDelta(
     current.count += next.count - prior.count;
     if (current.tokens === 0 && current.count === 0) delete target[key];
     else target[key] = current;
+  }
+}
+
+function applySkillHead(
+  target: AnalysisAcc,
+  skillHead: readonly TaggedAnalysisSkillUse[],
+): void {
+  target.skillUses = skillHead.map((entry) => ({ ...entry.value }));
+  target.skillPreambleCounts = skillHead.map((entry) => entry.preambleCount);
+  delete target.frameworkOverhead['skill-preamble'];
+  for (const entry of skillHead) {
+    if (entry.preambleCount <= 0) continue;
+    const current = target.frameworkOverhead['skill-preamble'] ?? { tokens: 0, count: 0 };
+    current.tokens += entry.value.estTokens;
+    current.count += entry.preambleCount;
+    target.frameworkOverhead['skill-preamble'] = current;
   }
 }
 
@@ -714,7 +770,12 @@ function refreshedSkillHead(
   const candidates = state.skillHead.filter((entry) => !appended.has(entry.fileId));
   for (const [fileId, analysis] of appended) {
     for (const [position, value] of analysis.skillUses.entries()) {
-      candidates.push({ fileId, position, value: { ...value } });
+      candidates.push({
+        fileId,
+        position,
+        value: { ...value },
+        preambleCount: analysis.skillPreambleCounts[position] ?? 0,
+      });
     }
   }
   candidates.sort((left, right) =>
@@ -729,10 +790,11 @@ function appendCalibration(
   previous: ClaudeUsageIndex,
   next: ClaudeUsageIndex,
   prior: AnalysisCalibration,
+  priorOldestTimestampMs: number | undefined,
   affectedMessages: ReadonlySet<string>,
   affectedDirect: ReadonlySet<string>,
   cutoffMs: number,
-): AnalysisCalibration {
+): { calibration: AnalysisCalibration; oldestTimestampMs?: number } {
   const keys = new Set<string>();
   for (const messageId of affectedMessages) {
     for (const identity of previous.canonicalIdentitiesByMessage.get(messageId) ?? []) {
@@ -744,13 +806,23 @@ function appendCalibration(
   }
   for (const identity of affectedDirect) keys.add(`usage:${identity}`);
   const calibration = { ...prior };
+  let oldestTimestampMs = priorOldestTimestampMs;
   for (const key of keys) {
     const before = calibrationContribution(previous.visibleRecords.get(key), cutoffMs);
-    const after = calibrationContribution(next.visibleRecords.get(key), cutoffMs);
+    const afterRecord = next.visibleRecords.get(key);
+    const after = calibrationContribution(afterRecord, cutoffMs);
     calibration.realOutputTokens += after.realOutputTokens - before.realOutputTokens;
     calibration.realInputSideTokens += after.realInputSideTokens - before.realInputSideTokens;
+    if (after.realOutputTokens > 0 || after.realInputSideTokens > 0) {
+      const timestampMs = Date.parse(afterRecord!.timestamp);
+      if (Number.isFinite(timestampMs)) {
+        oldestTimestampMs = oldestTimestampMs === undefined
+          ? timestampMs
+          : Math.min(oldestTimestampMs, timestampMs);
+      }
+    }
   }
-  return calibration;
+  return { calibration, oldestTimestampMs };
 }
 
 function compactUuidLayers(layers: readonly ReadonlySet<string>[]): ReadonlySet<string>[] {
@@ -781,8 +853,10 @@ function rebaseFileAnalysisCutoff(
       path: entry.path,
       fingerprint: entry,
       analysis: newAnalysisAcc(cutoffMs),
+      analysisOldestIncludedTimestampMs: undefined,
     };
-  } else if (first !== undefined && first < cutoffMs) {
+  } else if (prior.analysisOldestIncludedTimestampMs !== undefined &&
+    prior.analysisOldestIncludedTimestampMs < cutoffMs) {
     return null;
   }
   return {
@@ -819,11 +893,13 @@ async function parsePlan(
         analysis: analyzeContent ? newAnalysisAcc(analysisCutoffMs) : null,
         analysisAllUuids: new Set<string>(),
         analysisRangeComplete: analyzeContent,
+        analysisOldestIncludedTimestampMs: undefined,
         analysisHasUnboundedTimestamp: false,
       };
   if (!analyzeContent) base.analysis = null;
   else if (!base.analysis || base.analysis.cutoffMs !== analysisCutoffMs) {
     base.analysis = newAnalysisAcc(analysisCutoffMs);
+    base.analysisOldestIncludedTimestampMs = undefined;
   }
   const ownedAnalysisUuids = new Set(base.analysis?.seenUuids ?? []);
   if (base.analysis && analysisSeenUuids) {
@@ -855,6 +931,7 @@ async function parsePlan(
   }
 
   let linesParsed = 0;
+  const analysisTouchedUuids = new Set<string>();
   const scan = await scanCodexJsonlLines(
     runtimeEntry(plan.entry, plan.fileId),
     defaultCodexJsonlReader,
@@ -864,11 +941,12 @@ async function parsePlan(
       linesParsed += 1;
       try {
         const parsed = JSON.parse(line) as Record<string, unknown>;
-        if (analyzeContent && (typeof parsed.uuid === 'string' ||
-          (parsed.message !== null && typeof parsed.message === 'object'))) {
-          const analysisTimestampMs = typeof parsed.timestamp === 'string'
+        const analysisRelevant = analyzeContent && (typeof parsed.uuid === 'string' ||
+          (parsed.message !== null && typeof parsed.message === 'object'));
+        const analysisTimestampMs = typeof parsed.timestamp === 'string'
             ? Date.parse(parsed.timestamp)
             : NaN;
+        if (analysisRelevant) {
           if (Number.isFinite(analysisTimestampMs)) {
             base.analysisFirstTimestampMs = base.analysisFirstTimestampMs === undefined
               ? analysisTimestampMs
@@ -880,13 +958,27 @@ async function parsePlan(
             base.analysisHasUnboundedTimestamp = true;
           }
         }
-        if (typeof parsed.uuid === 'string') base.analysisAllUuids.add(parsed.uuid);
+        if (typeof parsed.uuid === 'string') {
+          base.analysisAllUuids.add(parsed.uuid);
+          analysisTouchedUuids.add(parsed.uuid);
+        }
         if (base.analysis) {
           const uuid = typeof parsed.uuid === 'string' ? parsed.uuid : undefined;
           const alreadySeen = uuid ? base.analysis.seenUuids.has(uuid) : false;
           analyzeLine(parsed, base.analysis, isSubagentFile, sessionInfo.sessionId);
-          if (uuid && !alreadySeen && base.analysis.seenUuids.has(uuid)) {
+          const newlyOwnedUuid = Boolean(
+            uuid && !alreadySeen && base.analysis.seenUuids.has(uuid),
+          );
+          if (uuid && newlyOwnedUuid) {
             ownedAnalysisUuids.add(uuid);
+          }
+          const includedWithoutUuid = !uuid && analysisRelevant &&
+            (!Number.isFinite(analysisTimestampMs) || analysisTimestampMs >= analysisCutoffMs);
+          if ((newlyOwnedUuid || includedWithoutUuid) && Number.isFinite(analysisTimestampMs)) {
+            base.analysisOldestIncludedTimestampMs =
+              base.analysisOldestIncludedTimestampMs === undefined
+                ? analysisTimestampMs
+                : Math.min(base.analysisOldestIncludedTimestampMs, analysisTimestampMs);
           }
         }
         if (base.firstTimestampMs === 0 && typeof parsed.timestamp === 'string') {
@@ -1005,7 +1097,13 @@ async function parsePlan(
       value.discoveryIndex = rankDiscoveryIndex;
     }
   }
-  return { ...plan, contribution: base, bytesRead: scan.bytesRead, linesParsed };
+  return {
+    ...plan,
+    contribution: base,
+    analysisTouchedUuids,
+    bytesRead: scan.bytesRead,
+    linesParsed,
+  };
 }
 
 function directIdentity(value: IndexedRecord): string | null {
@@ -1918,19 +2016,17 @@ export async function updateClaudeUsageIndex(
   const nowMs = Date.now();
   const analysisAsOfDay = dayKeyInZone(new Date(nowMs), configuredTimeZone);
   const previousAnalysisRuntime = analysisRuntimeByIndex.get(previous);
-  const analysisWindowIsStable = analyzeContent && previous.analyzeContent &&
-    !timeZoneChanged && previous.windowDays === windowDays &&
-    previous.analysisCutoffMs > 0;
-  const analysisCutoffMs = analysisWindowIsStable &&
-    previousAnalysisRuntime?.asOfDay === analysisAsOfDay
-    ? previous.analysisCutoffMs
-    : nowMs - windowDays * 24 * 60 * 60 * 1000;
+  // ClaudeDataLoader uses a continuously rolling millisecond cutoff. Keep the
+  // same contract here; timestamp frontiers below avoid reparsing when moving
+  // the cutoff cannot yet change any materialized contribution.
+  const analysisCutoffMs = nowMs - windowDays * 24 * 60 * 60 * 1000;
   const manifest = options.manifest ?? await scanUsageManifest([root]);
   const currentEntries = [...manifest.entries.values()];
   const previousByPath = new Map([...previous.files.values()].map((file) => [file.path, file]));
   const seenPrevious = new Set<string>();
   const plans: FilePlan[] = [];
   const analysisRebases = new Map<string, ClaudeUsageFileContribution>();
+  const analysisPayloadRebases = new Set<string>();
   const moves: Array<{ prior: ClaudeUsageFileContribution; entry: UsageFileFingerprint }> = [];
   const changed = { append: 0, rebuild: 0, move: 0, delete: 0 };
 
@@ -1945,40 +2041,119 @@ export async function updateClaudeUsageIndex(
       }
       const bodyUnchanged = sameIdentity.fingerprint.size === entry.size &&
         sameIdentity.fingerprint.mtimeMs === entry.mtimeMs;
-      const canRebaseAnalysis = bodyUnchanged && sameIdentity.path === entry.path &&
+      const canRebaseAnalysis = sameIdentity.path === entry.path &&
         analyzeContent && !timeZoneChanged && sameIdentity.analysis &&
         sameIdentity.analysis.cutoffMs !== analysisCutoffMs;
+      let rebasedAnalysis: ClaudeUsageFileContribution | undefined;
       if (canRebaseAnalysis) {
         const rebased = rebaseFileAnalysisCutoff(sameIdentity, entry, analysisCutoffMs);
-        if (rebased) analysisRebases.set(fileId, rebased);
+        if (rebased) {
+          rebasedAnalysis = rebased;
+          if (bodyUnchanged) {
+            analysisRebases.set(fileId, rebased);
+            if (!sameAnalysisPayload(sameIdentity, rebased)) analysisPayloadRebases.add(fileId);
+          }
+        }
       }
       const needsAnalysisBody = analyzeContent &&
         (timeZoneChanged || !sameIdentity.analysis ||
-          (sameIdentity.analysis.cutoffMs !== analysisCutoffMs && !analysisRebases.has(fileId)));
+          (sameIdentity.analysis.cutoffMs !== analysisCutoffMs && !rebasedAnalysis));
       if (bodyUnchanged && !needsAnalysisBody) continue;
       if (needsAnalysisBody) {
         analysisRebases.delete(fileId);
-        plans.push({ kind: 'rebuild', entry, fileId, prior: sameIdentity });
+        analysisPayloadRebases.delete(fileId);
+        plans.push({
+          kind: 'rebuild',
+          analysisReason: bodyUnchanged && !timeZoneChanged && Boolean(sameIdentity.analysis)
+            ? 'cutoff'
+            : 'source',
+          entry,
+          fileId,
+          prior: sameIdentity,
+        });
         changed.rebuild += 1;
         continue;
       }
       const append = entry.size > sameIdentity.fingerprint.size &&
         await appendPrefixStillMatches(sameIdentity, entry);
-      plans.push({ kind: append ? 'append' : 'rebuild', entry, fileId, prior: sameIdentity });
-      changed[append ? 'append' : 'rebuild'] += 1;
+      const rebaseChangedPayload = Boolean(
+        rebasedAnalysis && !sameAnalysisPayload(sameIdentity, rebasedAnalysis),
+      );
+      const plannedKind: FilePlan['kind'] = append && !rebaseChangedPayload
+        ? 'append'
+        : 'rebuild';
+      plans.push({
+        kind: plannedKind,
+        analysisReason: 'source',
+        entry,
+        fileId,
+        prior: append && rebasedAnalysis && !rebaseChangedPayload ? rebasedAnalysis : sameIdentity,
+      });
+      changed[plannedKind] += 1;
       continue;
     }
     const replaced = previousByPath.get(entry.path);
     if (replaced && !seenPrevious.has(replaced.fileId)) {
       seenPrevious.add(replaced.fileId);
-      plans.push({ kind: 'rebuild', entry, fileId, prior: replaced, replacedFileId: replaced.fileId });
+      plans.push({
+        kind: 'rebuild',
+        analysisReason: 'source',
+        entry,
+        fileId,
+        prior: replaced,
+        replacedFileId: replaced.fileId,
+      });
     } else {
-      plans.push({ kind: 'rebuild', entry, fileId });
+      plans.push({ kind: 'rebuild', analysisReason: 'source', entry, fileId });
     }
     changed.rebuild += 1;
   }
   const deletions = [...previous.files.values()].filter((file) => !seenPrevious.has(file.fileId));
   changed.delete = deletions.length;
+
+  const replaceWithFullAnalysisPlans = (): void => {
+    plans.length = 0;
+    analysisRebases.clear();
+    analysisPayloadRebases.clear();
+    for (const entry of currentEntries) {
+      const fileId = stableFileId(entry);
+      const sameIdentity = previous.files.get(fileId);
+      const replaced = sameIdentity ? undefined : previousByPath.get(entry.path);
+      plans.push({
+        kind: 'rebuild',
+        analysisReason: 'full',
+        entry,
+        fileId,
+        prior: sameIdentity ?? replaced,
+        ...(replaced && replaced.fileId !== fileId ? { replacedFileId: replaced.fileId } : {}),
+      });
+    }
+    changed.rebuild = Math.max(changed.rebuild, plans.length);
+  };
+
+  let forcedFullAnalysisRebuild = false;
+  if (analyzeContent) {
+    const sourcePlans = plans.filter((plan) => plan.analysisReason === 'source');
+    const soleSourcePlan = sourcePlans.length === 1 && plans.length === 1
+      ? sourcePlans[0]
+      : undefined;
+    const safeTailAppend = Boolean(
+      soleSourcePlan?.kind === 'append' && soleSourcePlan.prior &&
+      previousAnalysisRuntime && !timeZoneChanged &&
+      previous.windowDays === windowDays && analysisPayloadRebases.size === 0 &&
+      soleSourcePlan.prior.firstTimestampMs > 0,
+    );
+    const priorAnalysisCutoffMs = previousAnalysisRuntime?.cutoffMs ??
+      (previous.analyzeContent ? previous.analysisCutoffMs : undefined);
+    const cutoffMovedBackward = priorAnalysisCutoffMs !== undefined &&
+      analysisCutoffMs < priorAnalysisCutoffMs;
+    const unsafeSourceMutation = deletions.length > 0 || moves.length > 0 ||
+      (sourcePlans.length > 0 && !safeTailAppend);
+    forcedFullAnalysisRebuild = cutoffMovedBackward || unsafeSourceMutation;
+    if (forcedFullAnalysisRebuild) {
+      replaceWithFullAnalysisPlans();
+    }
+  }
 
   if (analyzeContent) {
     const removedOwnedUuids = new Set<string>();
@@ -2014,18 +2189,22 @@ export async function updateClaudeUsageIndex(
           .some((uuid) => removedOwnedUuids.has(uuid));
         if (!canRestoreOwnership) continue;
         analysisRebases.delete(fileId);
-        plans.push({ kind: 'rebuild', entry, fileId, prior });
+        plans.push({ kind: 'rebuild', analysisReason: 'ownership', entry, fileId, prior });
         plannedIds.add(fileId);
         changed.rebuild += 1;
       }
     }
   }
 
-  const fastAppendAnalysis = Boolean(
+  const calibrationCutoffIsStable = Boolean(
+    previousAnalysisRuntime && analysisCutoffMs >= previousAnalysisRuntime.cutoffMs &&
+    (previousAnalysisRuntime.calibrationOldestTimestampMs === undefined ||
+      analysisCutoffMs <= previousAnalysisRuntime.calibrationOldestTimestampMs),
+  );
+  let fastAppendAnalysis = Boolean(
     analyzeContent && previousAnalysisRuntime && previous.contentAnalysis &&
-    previousAnalysisRuntime.asOfDay === analysisAsOfDay &&
-    previousAnalysisRuntime.cutoffMs === analysisCutoffMs &&
-    analysisRebases.size === 0 && deletions.length === 0 && moves.length === 0 &&
+    !forcedFullAnalysisRebuild && calibrationCutoffIsStable &&
+    analysisPayloadRebases.size === 0 && deletions.length === 0 && moves.length === 0 &&
     plans.every((plan) => plan.kind === 'append' && Boolean(plan.prior)),
   );
 
@@ -2033,51 +2212,92 @@ export async function updateClaudeUsageIndex(
   const parsedPlans: ParsedPlan[] = [];
   let bytesRead = 0;
   let linesParsed = 0;
+  let bodyReads = 0;
   const analysisUuidAdditions = new Set<string>();
   try {
     const agentTypeCache = new Map<string, string>();
     const workflowNameCache = new Map<string, string>();
-    const analysisSeenUuids: Set<string> = fastAppendAnalysis && previousAnalysisRuntime
-      ? new LayeredAnalysisSeenUuids(
-          previousAnalysisRuntime.uuidLayers,
-          analysisUuidAdditions,
-        )
-      : new Set<string>();
-    if (analyzeContent) {
-      if (!fastAppendAnalysis) {
-        const excluded = new Set<string>([
-          ...deletions.map((file) => file.fileId),
-          ...plans.flatMap((plan) => plan.kind === 'rebuild' && plan.prior ? [plan.prior.fileId] : []),
-        ]);
-        for (const prior of previous.files.values()) {
-          if (excluded.has(prior.fileId)) continue;
-          const file = analysisRebases.get(prior.fileId) ?? prior;
-          for (const uuid of file.analysis?.seenUuids ?? []) analysisSeenUuids.add(uuid);
+    const parseSelectedPlans = async (useFastUuidLayers: boolean): Promise<void> => {
+      const analysisSeenUuids: Set<string> = useFastUuidLayers && previousAnalysisRuntime
+        ? new LayeredAnalysisSeenUuids(
+            previousAnalysisRuntime.uuidLayers,
+            analysisUuidAdditions,
+          )
+        : new Set<string>();
+      if (analyzeContent) {
+        if (!useFastUuidLayers) {
+          const excluded = new Set<string>([
+            ...deletions.map((file) => file.fileId),
+            ...plans.flatMap((plan) => plan.kind === 'rebuild' && plan.prior ? [plan.prior.fileId] : []),
+          ]);
+          for (const prior of previous.files.values()) {
+            if (excluded.has(prior.fileId)) continue;
+            const file = analysisRebases.get(prior.fileId) ?? prior;
+            for (const uuid of file.analysis?.seenUuids ?? []) analysisSeenUuids.add(uuid);
+          }
+        }
+        const rebuildPlans = plans.filter((plan) => plan.kind === 'rebuild');
+        if (rebuildPlans.length > 0) {
+          const sorted = await sortUsageFilesByEarliestTimestamp(rebuildPlans.map((plan) => plan.entry));
+          const order = new Map(sorted.files.map((file, index) => [file, index]));
+          plans.sort((left, right) => {
+            if (left.kind !== right.kind) return left.kind === 'rebuild' ? -1 : 1;
+            if (left.kind === 'append') return 0;
+            return (order.get(left.entry.path) ?? 0) - (order.get(right.entry.path) ?? 0);
+          });
         }
       }
-      const rebuildPlans = plans.filter((plan) => plan.kind === 'rebuild');
-      if (rebuildPlans.length > 0) {
-        const sorted = await sortUsageFilesByEarliestTimestamp(rebuildPlans.map((plan) => plan.entry));
-        const order = new Map(sorted.files.map((file, index) => [file, index]));
-        plans.sort((left, right) => {
-          if (left.kind !== right.kind) return left.kind === 'rebuild' ? -1 : 1;
-          if (left.kind === 'append') return 0;
-          return (order.get(left.entry.path) ?? 0) - (order.get(right.entry.path) ?? 0);
-        });
+      for (const plan of plans) {
+        const parsed = await parsePlan(
+          plan,
+          agentTypeCache,
+          workflowNameCache,
+          analyzeContent,
+          analysisCutoffMs,
+          analyzeContent ? analysisSeenUuids : undefined,
+        );
+        parsedPlans.push(parsed);
+        bodyReads += 1;
+        bytesRead += parsed.bytesRead;
+        linesParsed += parsed.linesParsed;
       }
-    }
-    for (const plan of plans) {
-      const parsed = await parsePlan(
-        plan,
-        agentTypeCache,
-        workflowNameCache,
-        analyzeContent,
-        analysisCutoffMs,
-        analyzeContent ? analysisSeenUuids : undefined,
-      );
-      parsedPlans.push(parsed);
-      bytesRead += parsed.bytesRead;
-      linesParsed += parsed.linesParsed;
+    };
+
+    await parseSelectedPlans(fastAppendAnalysis);
+
+    // A lone append can stay incremental anywhere in the established file
+    // order unless one of its new raw UUIDs also occurs in a later file. Such a
+    // collision changes the full loader's first owner, so retry the analysis as
+    // one globally ordered rebuild. The first tail read remains bounded and is
+    // the evidence used to choose the safe path.
+    if (fastAppendAnalysis && previousAnalysisRuntime && parsedPlans.length === 1 &&
+      parsedPlans[0].kind === 'append') {
+      const appended = parsedPlans[0];
+      const filePosition = previousAnalysisRuntime.orderedFileIds.indexOf(appended.fileId);
+      let laterOwnerCollision = filePosition < 0;
+      for (let index = filePosition + 1;
+        !laterOwnerCollision && index < previousAnalysisRuntime.orderedFileIds.length;
+        index += 1) {
+        const laterFile = previous.files.get(previousAnalysisRuntime.orderedFileIds[index]);
+        if (!laterFile) {
+          laterOwnerCollision = true;
+          break;
+        }
+        for (const uuid of appended.analysisTouchedUuids) {
+          if (laterFile.analysisAllUuids.has(uuid)) {
+            laterOwnerCollision = true;
+            break;
+          }
+        }
+      }
+      if (laterOwnerCollision) {
+        forcedFullAnalysisRebuild = true;
+        fastAppendAnalysis = false;
+        replaceWithFullAnalysisPlans();
+        parsedPlans.length = 0;
+        analysisUuidAdditions.clear();
+        await parseSelectedPlans(false);
+      }
     }
   } catch (error) {
     options.log?.(`incremental loader retained the previous snapshot: ${error instanceof Error ? error.name : 'read-error'}`);
@@ -2091,7 +2311,7 @@ export async function updateClaudeUsageIndex(
         bytesRead,
         linesParsed,
         readParseMs: performance.now() - started,
-        bodyReads: parsedPlans.length + 1,
+        bodyReads: bodyReads + 1,
         aggregateMutations: 0,
         changed,
       },
@@ -2184,7 +2404,12 @@ export async function updateClaudeUsageIndex(
   if (!analyzeContent) {
     next.contentAnalysis = null;
   } else if (fastAppendAnalysis && previousAnalysisRuntime && parsedPlans.length === 0) {
-    analysisRuntimeByIndex.set(next, previousAnalysisRuntime);
+    analysisRuntimeByIndex.set(next, {
+      ...previousAnalysisRuntime,
+      asOfDay: analysisAsOfDay,
+      cutoffMs: analysisCutoffMs,
+      merged: { ...previousAnalysisRuntime.merged, cutoffMs: analysisCutoffMs },
+    });
     next.contentAnalysis = previous.contentAnalysis;
   } else if (fastAppendAnalysis && previousAnalysisRuntime) {
     // Ordinary appends touch only changed per-file contributions, affected
@@ -2199,12 +2424,22 @@ export async function updateClaudeUsageIndex(
     const promptTail = refreshedPromptTail(previousAnalysisRuntime, appended);
     const skillHead = refreshedSkillHead(previousAnalysisRuntime, appended);
     merged.prompts = promptTail.map((entry) => ({ ...entry.value }));
-    merged.skillUses = skillHead.map((entry) => ({ ...entry.value }));
+    applySkillHead(merged, skillHead);
     merged.seenUuids = new Set<string>();
+    merged.cutoffMs = analysisCutoffMs;
     const uuidLayers = compactUuidLayers([
       ...previousAnalysisRuntime.uuidLayers,
       ...(analysisUuidAdditions.size > 0 ? [analysisUuidAdditions] : []),
     ]);
+    const calibrationState = appendCalibration(
+      previous,
+      next,
+      previousAnalysisRuntime.calibration,
+      previousAnalysisRuntime.calibrationOldestTimestampMs,
+      affectedMessages,
+      affectedDirect,
+      analysisCutoffMs,
+    );
     const runtime: AnalysisRuntimeState = {
       asOfDay: analysisAsOfDay,
       cutoffMs: analysisCutoffMs,
@@ -2212,29 +2447,23 @@ export async function updateClaudeUsageIndex(
       merged,
       promptTail,
       skillHead,
-      calibration: appendCalibration(
-        previous,
-        next,
-        previousAnalysisRuntime.calibration,
-        affectedMessages,
-        affectedDirect,
-        analysisCutoffMs,
-      ),
+      calibration: calibrationState.calibration,
+      calibrationOldestTimestampMs: calibrationState.oldestTimestampMs,
       uuidLayers,
     };
     analysisRuntimeByIndex.set(next, runtime);
     next.contentAnalysis = finalizeMaterializedAnalysis(runtime);
   } else {
-    // Cold starts, explicit rebuilds/deletions/timezone changes, and the one
-    // daily cutoff rollover rebuild the materialized in-memory view. File
-    // bodies are read only for changed or cutoff-straddling contributions.
+    // Cold starts, unsafe source-order changes, explicit timezone changes, and
+    // cutoff crossings rebuild the materialized in-memory view. Timestamp
+    // frontiers keep refreshes between crossings on the append fast path.
     const runtime = buildAnalysisRuntimeState(next, analysisAsOfDay, analysisCutoffMs);
     analysisRuntimeByIndex.set(next, runtime);
     next.contentAnalysis = finalizeMaterializedAnalysis(runtime);
   }
 
   options.log?.(
-    `incremental loader: bodies=${parsedPlans.length}, bytes=${bytesRead}, ` +
+    `incremental loader: bodies=${bodyReads}, bytes=${bytesRead}, ` +
     `lines=${linesParsed}, aggregate-mutations=${aggregateMutations}`,
   );
   return {
@@ -2247,7 +2476,7 @@ export async function updateClaudeUsageIndex(
       bytesRead,
       linesParsed,
       readParseMs: performance.now() - started,
-      bodyReads: parsedPlans.length,
+      bodyReads,
       aggregateMutations,
       changed,
     },

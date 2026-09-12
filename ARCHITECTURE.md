@@ -278,23 +278,35 @@ per-file index: unchanged refreshes read zero JSONL bodies, appends read only a
 verified tail, and truncate/replace/move/delete changes rebuild only affected
 files and aggregate groups. Content-analysis contributions and the established
 cross-file response-identity rules are updated through the same atomic path.
-Content analysis keeps a process-local materialized accumulator: an ordinary
-same-day append applies only the changed file delta and recalibrates only the
-affected canonical response identities. Duplicate UUID lookups use at most 64
-immutable layers; an occasional O(U) compaction replaces rebuilding the full
-UUID set on every append. At configured-zone midnight the rolling cutoff moves.
-Whole files known to be entirely retained or expired are rebased from timestamp
-metadata with no body read; only cutoff-straddling files, legacy contributions
-without complete range metadata, explicit timezone changes, and ordinary file
-rebuild/delete cases take the slow path. That path is O(F + A + R) in memory
-(files, retained analysis state, and calibration records) and reads only the
-affected file bodies; it is unavoidable for a cold build or migration and runs
-at most once per local day for an unchanged corpus. The public result still
-materializes its established records array, but content calibration no longer
-creates a second all-record copy. A new Extension Host performs one cold
-in-memory build; watcher-driven refreshes do not reread and reaggregate the
-complete corpus. Codex uses its own quiet debounce (default 30 seconds,
-configurable to Off/10/30/60/120/300).
+Content analysis keeps a process-local materialized accumulator. Its cutoff is
+the same continuously rolling millisecond cutoff used by `ClaudeDataLoader`, not
+a local-midnight approximation. Per-file oldest-admitted timestamps and the
+oldest calibration record act as frontiers: moving the cutoff between frontiers
+changes no result and needs no body read, while whole retained or expired files
+can be rebased from metadata. Crossing a frontier reparses the affected boundary
+and any UUID claimant whose first-owner status may change.
+
+An ordinary single-file append first reads only the verified tail, applies the
+changed-file delta, and recalibrates only affected canonical response identities.
+Duplicate UUID lookups use at most 64 immutable layers; an occasional O(U)
+compaction replaces rebuilding the full UUID set on every append. If the tail
+contains a UUID also present in a later file, global first-owner order may change,
+so the provisional tail result is discarded and analysis is rebuilt in the
+loader's complete file order. New/replaced files, multi-file appends, moves,
+deletes, backward cutoff movement, and an append that gives an undated file its
+first timestamp use the same correctness-first ordered rebuild. This deliberately
+narrows the optimization instead of retaining a fast path that can disagree with
+the full loader. Per-file skill candidates retain matching preamble-event counts;
+the global 5,000-use cap is applied only during ordered materialization.
+
+The slow materialization path is O(F + A + R) in memory (files, retained analysis
+state, and calibration records). Cutoff-only work reads boundary/claimant files;
+source-order changes may reread the complete corpus to re-establish first-owner,
+prompt-order, and skill-cap semantics. The public result still materializes its
+established records array, but content calibration no longer creates a second
+all-record copy. A new Extension Host performs one cold in-memory build. Codex
+uses its own quiet debounce (default 30 seconds, configurable to
+Off/10/30/60/120/300).
 Claude log, Codex log, and Claude credentials-directory watchers all treat
 `fs.watch` as an acceleration path: asynchronous watcher errors close the
 affected handle and use capped exponential re-arming while polling remains the

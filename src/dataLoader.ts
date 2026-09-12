@@ -117,6 +117,11 @@ export interface AnalysisAcc {
   // Skill / slash-command invocations (capped) + tool_use_id → skillUses index
   // so the matching tool result's size can be attributed to the skill.
   skillUses: SkillUse[];
+  // Per-skill count of matching tool-result blocks. Per-file incremental
+  // contributions retain this alongside every local skill candidate so the
+  // global 5,000-use cap can be applied before skill-preamble overhead is
+  // materialized, exactly like the one-accumulator full loader.
+  skillPreambleCounts: number[];
   skillByToolId: Record<string, number>;
   frameworkOverhead: Partial<Record<FrameworkOverheadKind, { tokens: number; count: number }>>;
   observedInputEstimatedTokens: number;
@@ -136,6 +141,7 @@ export function newAnalysisAcc(cutoffMs: number): AnalysisAcc {
     thinkingBySession: {},
     thinkingByDay: {},
     skillUses: [],
+    skillPreambleCounts: [],
     skillByToolId: {},
     frameworkOverhead: {},
     observedInputEstimatedTokens: 0,
@@ -214,6 +220,7 @@ function collectCommandUse(acc: AnalysisAcc, text: string, sessionId: string, ti
     ts: isNaN(ts) ? 0 : ts,
     estTokens: estimateTokens(text),
   });
+  acc.skillPreambleCounts.push(0);
 }
 
 // Rough token estimate from text length (CJK characters are denser than ASCII).
@@ -395,6 +402,7 @@ export function analyzeLine(parsed: any, acc: AnalysisAcc, isSubagentFile = fals
                 ts: isNaN(skillTs) ? 0 : skillTs,
                 estTokens: 0,
               });
+              acc.skillPreambleCounts.push(0);
             }
           }
           const inputJson = JSON.stringify(block.input || {});
@@ -443,6 +451,7 @@ export function analyzeLine(parsed: any, acc: AnalysisAcc, isSubagentFile = fals
           if (skillIdx !== undefined && acc.skillUses[skillIdx]) {
             const skillTokens = estimateTokens(text);
             acc.skillUses[skillIdx].estTokens += skillTokens;
+            acc.skillPreambleCounts[skillIdx] = (acc.skillPreambleCounts[skillIdx] ?? 0) + 1;
             addFrameworkOverhead(acc, 'skill-preamble', skillTokens);
           }
         } else if (block.type === 'text' && typeof block.text === 'string') {
@@ -530,13 +539,25 @@ export function mergeAnalysisAcc(target: AnalysisAcc, source: AnalysisAcc): void
   };
   mergeThinking(target.thinkingBySession, source.thinkingBySession);
   mergeThinking(target.thinkingByDay, source.thinkingByDay);
-  for (const use of source.skillUses) {
+  for (const [index, use] of source.skillUses.entries()) {
     if (target.skillUses.length >= MAX_SKILL_USES) break;
     target.skillUses.push({ ...use });
+    const preambleCount = source.skillPreambleCounts[index] ?? 0;
+    target.skillPreambleCounts.push(preambleCount);
+    if (preambleCount > 0) {
+      const current = target.frameworkOverhead['skill-preamble'] ?? { tokens: 0, count: 0 };
+      current.tokens += use.estTokens;
+      current.count += preambleCount;
+      target.frameworkOverhead['skill-preamble'] = current;
+    }
   }
   for (const [kind, value] of Object.entries(source.frameworkOverhead) as Array<
     [FrameworkOverheadKind, { tokens: number; count: number }]
   >) {
+    // Skill preambles follow the same global cap as their Skill invocation.
+    // They were accumulated locally while parsing so matching tool results can
+    // still be associated, then are reconstructed above only for retained uses.
+    if (kind === 'skill-preamble') continue;
     const current = target.frameworkOverhead[kind] ?? { tokens: 0, count: 0 };
     current.tokens += value.tokens;
     current.count += value.count;
