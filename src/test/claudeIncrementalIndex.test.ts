@@ -205,14 +205,23 @@ test('default content analysis does not revisit historical file contributions af
     assert.equal(cold.diagnostics.bodyReads, 256);
 
     let historicalContributionReads = 0;
+    let historicalOrderReads = 0;
     for (const file of cold.index.files.values()) {
       if (file.path === files[files.length - 1] || !file.analysis) continue;
       const categories = file.analysis.cat;
+      const firstTimestampMs = file.firstTimestampMs;
       Object.defineProperty(file.analysis, 'cat', {
         configurable: true,
         get: () => {
           historicalContributionReads += 1;
           return categories;
+        },
+      });
+      Object.defineProperty(file, 'firstTimestampMs', {
+        configurable: true,
+        get: () => {
+          historicalOrderReads += 1;
+          return firstTimestampMs;
         },
       });
     }
@@ -227,6 +236,7 @@ test('default content analysis does not revisit historical file contributions af
     assert.equal(warm.diagnostics.bodyReads, 1);
     assert.equal(warm.diagnostics.bytesRead, Buffer.byteLength(tail));
     assert.equal(historicalContributionReads, 0);
+    assert.equal(historicalOrderReads, 0);
     assert.deepEqual(warm.contentAnalysis, full.contentAnalysis);
   } finally {
     Date.now = previousNow;
@@ -286,6 +296,39 @@ test('content analysis expires a completed boundary file after configured-zone m
       1,
     );
     assert.deepEqual(warm.contentAnalysis, full.contentAnalysis);
+  } finally {
+    Date.now = previousNow;
+    I18n.setTimezone(previousTimeZone);
+  }
+});
+
+test('a malformed content line keeps cutoff rebasing conservative', async () => {
+  const previousNow = Date.now;
+  const previousTimeZone = I18n.getTimezone();
+  let now = Date.parse('2026-09-10T15:59:30.000Z');
+  Date.now = () => now;
+  I18n.setTimezone('Asia/Hong_Kong');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ccu-claude-content-malformed-'));
+  roots.push(root);
+  const project = path.join(root, 'projects', '-fixture-content-malformed');
+  await mkdir(project, { recursive: true });
+  try {
+    const file = path.join(project, 'malformed.jsonl');
+    await writeFile(file, [
+      usageLine('content-malformed-active', 20, 2, {
+        timestamp: '2026-09-10T15:00:00.000Z',
+      }),
+      '{malformed-json',
+      '',
+    ].join('\n'), 'utf8');
+    const cold = await updateClaudeUsageIndex(createClaudeUsageIndex(), root);
+
+    now = Date.parse('2026-09-10T16:00:30.000Z');
+    const warm = await updateClaudeUsageIndex(cold.index, root);
+
+    assert.equal(warm.diagnostics.bodyReads, 1);
+    assert.equal(warm.diagnostics.changed.rebuild, 1);
+    assert.deepEqual(warm.contentAnalysis, cold.contentAnalysis);
   } finally {
     Date.now = previousNow;
     I18n.setTimezone(previousTimeZone);

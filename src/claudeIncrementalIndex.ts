@@ -981,6 +981,7 @@ async function parsePlan(
           record,
         });
       } catch {
+        if (analyzeContent) base.analysisRangeComplete = false;
         // The established loader treats an invalid JSON line as local damage,
         // not a reason to discard every verified record in the file.
       }
