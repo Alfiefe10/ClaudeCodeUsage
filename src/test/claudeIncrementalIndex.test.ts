@@ -291,8 +291,10 @@ test('cross-file tool results retain global tool and Skill preamble attribution'
   roots.push(root);
   const project = path.join(root, 'projects', '-fixture-cross-file-tools');
   await mkdir(project, { recursive: true });
+  const usesFile = path.join(project, 'uses.jsonl');
+  const resultsFile = path.join(project, 'results.jsonl');
   try {
-    await writeFile(path.join(project, 'uses.jsonl'), `${analysisBlocksLine(
+    await writeFile(usesFile, `${analysisBlocksLine(
       'cross-file-tool-uses',
       'assistant',
       [
@@ -301,12 +303,14 @@ test('cross-file tool results retain global tool and Skill preamble attribution'
       ],
       '2026-09-10T09:00:00.000Z',
     )}\n`, 'utf8');
-    await writeFile(path.join(project, 'results.jsonl'), `${analysisBlocksLine(
+    await writeFile(resultsFile, `${analysisBlocksLine(
       'cross-file-tool-results',
       'user',
       [
         { type: 'tool_result', tool_use_id: 'cross-file-read', content: 'read payload across files' },
         { type: 'tool_result', tool_use_id: 'cross-file-skill', content: 'skill preamble across files' },
+        { type: 'tool_result', tool_use_id: 'late-cross-file-read', content: 'result before its file-order use exists' },
+        { type: 'tool_result', tool_use_id: 'late-cross-file-skill', content: 'preamble before its file-order Skill exists' },
       ],
       '2026-09-10T10:00:00.000Z',
     )}\n`, 'utf8');
@@ -325,6 +329,25 @@ test('cross-file tool results retain global tool and Skill preamble attribution'
         .find((component) => component.kind === 'skill-preamble')?.count,
       1,
     );
+
+    await appendFile(usesFile, `${analysisBlocksLine(
+      'late-cross-file-uses',
+      'assistant',
+      [
+        { type: 'tool_use', id: 'late-cross-file-read', name: 'Grep', input: { pattern: 'x' } },
+        { type: 'tool_use', id: 'late-cross-file-skill', name: 'Skill', input: { skill: 'late-audit-skill' } },
+      ],
+      '2026-09-10T09:01:00.000Z',
+    )}\n`, 'utf8');
+    const warm = await updateClaudeUsageIndex(incremental.index, root);
+    const warmFull = await ClaudeDataLoader.loadUsageRecords(root, { analyzeContent: true });
+    assert.equal(warm.diagnostics.bodyReads, 1);
+    assert.deepEqual(warm.contentAnalysis, warmFull.contentAnalysis);
+    assert.equal(
+      warm.contentAnalysis?.toolResultBreakdown.find((slice) => slice.key === 'Grep')?.count,
+      1,
+    );
+    assert.ok((warm.contentAnalysis?.skillUses[1]?.estTokens ?? 0) > 0);
   } finally {
     Date.now = previousNow;
   }
@@ -1593,7 +1616,8 @@ test('valid JSON at EOF without a newline matches the legacy full scan', async (
   roots.push(root);
   const project = path.join(root, 'projects', '-fixture-valid-eof');
   await mkdir(project, { recursive: true });
-  await writeFile(path.join(project, 'session.jsonl'), usageLine('valid-eof', 17, 5), 'utf8');
+  const file = path.join(project, 'session.jsonl');
+  await writeFile(file, usageLine('valid-eof', 17, 5), 'utf8');
 
   const cold = await updateClaudeUsageIndex(createClaudeUsageIndex(), root, {
     analyzeContent: false,
@@ -1606,6 +1630,14 @@ test('valid JSON at EOF without a newline matches the legacy full scan', async (
   });
   assert.equal(unchanged.diagnostics.bodyReads, 0);
   await assertMatchesFull(root, unchanged.records);
+
+  await appendFile(file, `\n${usageLine('second-valid-eof', 19, 7)}`, 'utf8');
+  const appended = await updateClaudeUsageIndex(unchanged.index, root, {
+    analyzeContent: false,
+  });
+  assert.equal(appended.diagnostics.bodyReads, 1);
+  assert.equal(appended.diagnostics.linesParsed, 1);
+  await assertMatchesFull(root, appended.records);
 });
 
 test('request-id cardinality changes re-resolve only the affected message identity', async () => {

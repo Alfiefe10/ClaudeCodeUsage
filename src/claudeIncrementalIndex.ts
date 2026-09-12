@@ -136,6 +136,7 @@ interface ClaudeUsageFileContribution {
   fingerprint: UsageFileFingerprint;
   offset: number;
   tailSignature: string;
+  acceptedValidEof: boolean;
   firstTimestampMs: number;
   recentPrompts: Map<string, number>;
   usage: Map<string, IndexedRecord>;
@@ -465,6 +466,36 @@ async function appendPrefixStillMatches(
   if (prior.offset <= 0) return true;
   try {
     return await tailSignature(entry.path, prior.offset) === prior.tailSignature;
+  } catch {
+    return false;
+  }
+}
+
+async function appendBoundaryStillMatches(
+  prior: ClaudeUsageFileContribution,
+  entry: UsageFileFingerprint,
+): Promise<boolean> {
+  if (!prior.acceptedValidEof) return true;
+  try {
+    const handle = await open(entry.path, 'r');
+    try {
+      const buffer = Buffer.allocUnsafe(Math.min(2, entry.size - prior.offset));
+      const result = await handle.read(buffer, 0, buffer.length, prior.offset);
+      if (result.bytesRead < 1) return false;
+      return buffer[0] === 0x0a ||
+        (buffer[0] === 0x0d && result.bytesRead > 1 && buffer[1] === 0x0a);
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
+function isValidJsonLine(line: string): boolean {
+  try {
+    JSON.parse(line);
+    return true;
   } catch {
     return false;
   }
@@ -1137,6 +1168,7 @@ async function parsePlan(
         fingerprint: plan.entry,
         offset: 0,
         tailSignature: '',
+        acceptedValidEof: false,
         firstTimestampMs: orderTimestampMs,
         recentPrompts: new Map<string, number>(),
         usage: new Map<string, IndexedRecord>(),
@@ -1191,6 +1223,7 @@ async function parsePlan(
     { offset: base.offset, discardingOversizedLine: false },
     plan.entry.size,
     (line, endOffset) => {
+      if (line.trim() === '') return;
       linesParsed += 1;
       try {
         const parsed = JSON.parse(line) as Record<string, unknown>;
@@ -1326,16 +1359,19 @@ async function parsePlan(
           record,
         });
       } catch {
-        if (analyzeContent) base.analysisRangeComplete = false;
         // The established loader treats an invalid JSON line as local damage,
-        // not a reason to discard every verified record in the file.
+        // not a reason to discard every verified record in the file. This
+        // callback receives only completed lines, so the damage stays ignored
+        // until a changed manifest fingerprint causes a bounded reread.
       }
     },
     undefined,
     Number.POSITIVE_INFINITY,
+    isValidJsonLine,
   );
   if (!scan.reachedEnd) throw new Error('Claude log changed during bounded read');
   base.offset = scan.cursor.offset;
+  base.acceptedValidEof = scan.finalLineAccepted;
   base.fingerprint = plan.entry;
   base.path = plan.entry.path;
   base.tailSignature = await tailSignature(plan.entry.path, base.offset);
@@ -2334,7 +2370,7 @@ export async function updateClaudeUsageIndex(
         }
       }
       const needsAnalysisBody = analyzeContent &&
-        (timeZoneChanged || !sameIdentity.analysis ||
+        (timeZoneChanged || !previous.analyzeContent || !sameIdentity.analysis ||
           (sameIdentity.analysis.cutoffMs !== analysisCutoffMs && !rebasedAnalysis));
       if (bodyUnchanged && !needsAnalysisBody) {
         if (sameIdentity.path === entry.path &&
@@ -2359,7 +2395,8 @@ export async function updateClaudeUsageIndex(
         continue;
       }
       const append = entry.size > sameIdentity.fingerprint.size &&
-        await appendPrefixStillMatches(sameIdentity, entry);
+        await appendPrefixStillMatches(sameIdentity, entry) &&
+        await appendBoundaryStillMatches(sameIdentity, entry);
       const rebaseChangedPayload = Boolean(
         rebasedAnalysis && !sameAnalysisPayload(sameIdentity, rebasedAnalysis),
       );
