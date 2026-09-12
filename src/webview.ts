@@ -1270,7 +1270,9 @@ export class UsageWebviewProvider {
       // Prompt text remains host-only. Its digest merely invalidates a preview
       // if the separately consented sample set changes before send.
       promptSampleDigest: createHash('sha256')
-        .update(state.promptSamples.map((sample) => sample.text).join('\u0000'), 'utf8')
+        // JSON preserves both array boundaries and embedded control characters.
+        // A delimiter alone is ambiguous because prompt text may contain it.
+        .update(JSON.stringify(state.promptSamples.map((sample) => sample.text)), 'utf8')
         .digest('hex'),
       userContextDigest: createHash('sha256')
         .update(state.userContext ?? '', 'utf8')
@@ -10891,6 +10893,20 @@ async function ccuVerifyCanonicalPreview(body, sha256, utf8Bytes) {
 }
 var advicePreviewValidationGeneration = {};
 var optimizerPreviewValidationGeneration = 0;
+function adviceCancelPendingPreviewValidation(provider) {
+  if (provider !== 'claude' && provider !== 'codex') { return 0; }
+  var generation = (advicePreviewValidationGeneration[provider] || 0) + 1;
+  advicePreviewValidationGeneration[provider] = generation;
+  return generation;
+}
+function adviceInvalidateAndClearPreview(provider) {
+  adviceCancelPendingPreviewValidation(provider);
+  adviceClearPreview(provider);
+}
+function adviceInvalidateAllPreviews() {
+  adviceInvalidateAndClearPreview('claude');
+  adviceInvalidateAndClearPreview('codex');
+}
 function ccuProviderName() {
   var selected = document.querySelector('.provider-tab[aria-selected="true"]');
   return selected ? (selected.getAttribute('data-provider') || selected.id.replace('provider-tab-', '')) : 'claude';
@@ -12537,7 +12553,7 @@ document.addEventListener('change', function(event) {
   if (!elements.aggregate || !elements.prompt) { return; }
   if (!elements.aggregate.checked) { elements.prompt.checked = false; }
   adviceSyncConsentControls(provider);
-  adviceClearPreview(provider);
+  adviceInvalidateAndClearPreview(provider);
   vscode.postMessage({ command: 'discardAdviceSnapshot', provider: provider });
   adviceSetConsentPending(provider, true);
   vscode.postMessage({
@@ -12570,6 +12586,7 @@ document.addEventListener('click', function(event) {
     event.preventDefault();
     var elements = adviceConsentElements(provider);
     if (!elements.aggregate || !elements.prompt || !elements.aggregate.checked) { return; }
+    adviceCancelPendingPreviewValidation(provider);
     action.disabled = true;
     if (elements.consentStatus) { elements.consentStatus.textContent = ''; }
     vscode.postMessage({
@@ -12641,6 +12658,7 @@ document.addEventListener('click', function(event) {
     event.preventDefault();
     if (!window.confirm(__adviceCopy.clearLocalDataConfirm)) { return; }
     action.disabled = true;
+    adviceInvalidateAllPreviews();
     vscode.postMessage({ command: 'clearAdviceLocalData' });
   }
 });
@@ -12671,6 +12689,9 @@ window.addEventListener('message', async function(event) {
   if (message.command === 'localDataClientAction') {
     var localDataClientActionOk = false;
     try {
+      if (message.action === 'clear-all-client-state') {
+        adviceInvalidateAllPreviews();
+      }
       localDataClientActionOk = ccuApplyLocalDataClientAction(message.action) === true;
     } catch (e) {}
     if (typeof message.requestId === 'string' && message.requestId.length > 0) {
@@ -12721,9 +12742,13 @@ window.addEventListener('message', async function(event) {
         consentElements.aggregate.checked = message.aggregateConsent === 'explicit';
         consentElements.prompt.checked =
           consentElements.aggregate.checked && message.promptSampleConsent === 'explicit';
+        if (!consentElements.aggregate.checked) {
+          adviceInvalidateAndClearPreview(consentProvider);
+        }
         adviceSetConsentPending(consentProvider, false);
         if (consentElements.consentStatus) { consentElements.consentStatus.textContent = ''; }
       } else {
+        adviceInvalidateAndClearPreview(consentProvider);
         consentElements.aggregate.checked = false;
         consentElements.prompt.checked = false;
         consentElements.aggregate.disabled = true;
@@ -12738,11 +12763,9 @@ window.addEventListener('message', async function(event) {
 
   if (message.command === 'adviceSnapshotResult') {
     var snapshotProvider = message.provider;
-    var snapshotValidationGeneration =
-      (advicePreviewValidationGeneration[snapshotProvider] || 0) + 1;
-    advicePreviewValidationGeneration[snapshotProvider] = snapshotValidationGeneration;
+    if (snapshotProvider !== 'claude' && snapshotProvider !== 'codex') { return; }
+    var snapshotValidationGeneration = adviceCancelPendingPreviewValidation(snapshotProvider);
     var snapshotElements = adviceConsentElements(snapshotProvider);
-    if (snapshotElements.previewButton) { snapshotElements.previewButton.disabled = false; }
     adviceClearPreview(snapshotProvider);
     var validSnapshot =
       message.ok === true &&
@@ -12763,6 +12786,21 @@ window.addEventListener('message', async function(event) {
       );
     }
     if (advicePreviewValidationGeneration[snapshotProvider] !== snapshotValidationGeneration) {
+      return;
+    }
+    var currentSnapshotElements = adviceConsentElements(snapshotProvider);
+    var currentConsentValid =
+      currentSnapshotElements.root === snapshotElements.root &&
+      currentSnapshotElements.preview === snapshotElements.preview &&
+      currentSnapshotElements.aggregate &&
+      !currentSnapshotElements.aggregate.disabled &&
+      currentSnapshotElements.aggregate.checked &&
+      (message.dataMode === 'aggregates-only' ||
+        (currentSnapshotElements.prompt &&
+          !currentSnapshotElements.prompt.disabled &&
+          currentSnapshotElements.prompt.checked));
+    if (!currentConsentValid) {
+      adviceClearPreview(snapshotProvider);
       return;
     }
     if (!validSnapshot || !snapshotElements.preview) {
@@ -12817,7 +12855,7 @@ window.addEventListener('message', async function(event) {
       if (sendElements.consentStatus) {
         sendElements.consentStatus.textContent = __adviceCopy.sentPreparedRequest;
       }
-      adviceClearPreview(sendProvider);
+      adviceInvalidateAndClearPreview(sendProvider);
     } else {
       if (sendElements.sendButton) {
         sendElements.sendButton.disabled = false;
@@ -12889,6 +12927,9 @@ window.addEventListener('message', async function(event) {
     document.querySelectorAll('[data-advice-action="clear"]').forEach(function(button) {
       button.disabled = false;
     });
+  }
+  if (message.command === 'adviceClearResult' && message.ok === true) {
+    adviceInvalidateAllPreviews();
   }
 
   if (message.command === 'shareCardResult') {

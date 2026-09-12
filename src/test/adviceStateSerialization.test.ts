@@ -168,6 +168,45 @@ test('live dashboard patches expose only host-current sealed preview IDs', async
   assert.deepEqual(stalePatch.adviceSnapshotIds, {});
 });
 
+test('prompt sample boundaries cannot collide in the sealed source revision', async () => {
+  const initial = grantedState(true);
+  const storage = new ControlledStorage(initial);
+  const { provider, messages } = await preparedProvider(storage, initial);
+  provider.currentProvider = 'claude';
+  provider.currentTab = 'content';
+  provider.hourlyDataForRolling30DaysByDay = {};
+
+  const providerState = provider.adviceEffectivenessStates.claude;
+  providerState.promptSamples = [{ text: 'alpha\u0000beta' }, { text: 'gamma' }];
+  provider.handlePrepareAdviceSnapshotMessage({
+    provider: 'claude', aggregateConsent: 'explicit', promptSampleConsent: 'explicit',
+  });
+  const snapshotId = [...provider.preparedAdviceSnapshots.keys()][0];
+  assert.ok(snapshotId);
+
+  // The concatenated bytes are identical if sample boundaries are represented
+  // by a NUL delimiter, while the sealed JSON payloads are different.
+  providerState.promptSamples = [{ text: 'alpha' }, { text: 'beta\u0000gamma' }];
+  const documentHtml = [
+    '<!DOCTYPE html>',
+    '<!-- ccu-live-panel:start --><section>fresh</section><!-- ccu-live-panel:end -->',
+    '<script>const hours = /* ccu-live-hours:start */{}/* ccu-live-hours:end */;</script>',
+  ].join('');
+  const patch = provider.dashboardLivePatchFor(documentHtml);
+  assert.ok(patch);
+  assert.deepEqual(patch.adviceSnapshotIds, {}, 'the old payload must not remain restorable');
+
+  let sends = 0;
+  provider.onSendAdviceInvocation = async () => {
+    sends += 1;
+    return { ok: false, code: 'transport-error' };
+  };
+  messages.length = 0;
+  await provider.handleSendAdviceSnapshotMessage({ provider: 'claude', snapshotId });
+  assert.equal(sends, 0, 'the old payload must not remain sendable');
+  assert.equal(messages[messages.length - 1]?.reason, 'stale-preview');
+});
+
 test('withdrawal rejects an old preview before its durable consent write completes', async () => {
   const initial = grantedState();
   const storage = new ControlledStorage(initial);

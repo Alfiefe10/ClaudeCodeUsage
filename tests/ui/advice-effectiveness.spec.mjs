@@ -93,6 +93,28 @@ async function grantAggregateConsent(page) {
   await expect(aggregate).toBeChecked();
 }
 
+async function gateNextAdvicePreviewValidation(page) {
+  await page.evaluate(() => {
+    const original = globalThis.ccuVerifyCanonicalPreview;
+    if (typeof original !== 'function') {
+      throw new Error('Canonical preview verifier is unavailable');
+    }
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    globalThis.__ccuAdvicePreviewValidationStarted = false;
+    globalThis.__ccuReleaseAdvicePreviewValidation = release;
+    globalThis.ccuVerifyCanonicalPreview = async (...args) => {
+      globalThis.__ccuAdvicePreviewValidationStarted = true;
+      await gate;
+      return original(...args);
+    };
+  });
+}
+
+async function releaseAdvicePreviewValidation(page) {
+  await page.evaluate(() => globalThis.__ccuReleaseAdvicePreviewValidation());
+}
+
 async function seriousOrCriticalViolations(page, include) {
   const builder = new AxeBuilder({ page });
   if (include) builder.include(include);
@@ -352,15 +374,63 @@ test('sealed preview renders the exact canonical body, UTF-8 size, and SHA-256',
   expect(networkAfterLoad).toEqual([]);
 });
 
+test('withdrawing consent cancels a preview whose digest validation is pending', async ({ page }) => {
+  const fixture = buildAdviceEffectivenessFixture({ locale: 'en' });
+  await openCandidate(page, 'claude');
+  await grantAggregateConsent(page);
+  await gateNextAdvicePreviewValidation(page);
+
+  const root = page.locator('[data-advice-provider="claude"]');
+  await root.locator('[data-advice-action="preview"]').click();
+  await dispatchHostMessage(page, fixture.snapshotMessages.aggregateOnly);
+  await expect.poll(() => page.evaluate(() =>
+    globalThis.__ccuAdvicePreviewValidationStarted)).toBe(true);
+
+  const aggregate = root.locator('[data-advice-consent-kind="aggregate"]');
+  await aggregate.focus();
+  await aggregate.press('Space');
+  await expectPostedCount(page, 'discardAdviceSnapshot', 2);
+  await releaseAdvicePreviewValidation(page);
+
+  const preview = root.locator('[data-advice-preview]');
+  await expect(aggregate).not.toBeChecked();
+  await expect(preview).toBeHidden();
+  await expect(preview.locator('[data-advice-preview-body]')).toHaveText('');
+  await expect(root.locator('[data-advice-action="send"]')).toBeDisabled();
+});
+
+test('clearing local advice data cancels a preview whose digest validation is pending', async ({ page }) => {
+  const fixture = buildAdviceEffectivenessFixture({ locale: 'en' });
+  await openCandidate(page, 'claude');
+  await grantAggregateConsent(page);
+  await gateNextAdvicePreviewValidation(page);
+
+  const root = page.locator('[data-advice-provider="claude"]');
+  await root.locator('[data-advice-action="preview"]').click();
+  await dispatchHostMessage(page, fixture.snapshotMessages.aggregateOnly);
+  await expect.poll(() => page.evaluate(() =>
+    globalThis.__ccuAdvicePreviewValidationStarted)).toBe(true);
+
+  page.once('dialog', (dialog) => dialog.accept());
+  await root.locator('[data-advice-action="clear"]').click();
+  await expectPostedCount(page, 'clearAdviceLocalData', 1);
+  await releaseAdvicePreviewValidation(page);
+
+  const preview = root.locator('[data-advice-preview]');
+  await expect(preview).toBeHidden();
+  await expect(preview.locator('[data-advice-preview-body]')).toHaveText('');
+  await expect(root.locator('[data-advice-action="send"]')).toBeDisabled();
+});
+
 test('a live dashboard patch preserves vertical position inside the advice payload preview', async ({ page }) => {
   const fixture = buildAdviceEffectivenessFixture({ locale: 'en' });
   const bodyText = JSON.stringify(
-    JSON.parse(fixture.snapshotMessages.withPromptSamples.body),
+    JSON.parse(fixture.snapshotMessages.aggregateOnly.body),
     null,
     2,
   );
   const snapshotMessage = {
-    ...fixture.snapshotMessages.withPromptSamples,
+    ...fixture.snapshotMessages.aggregateOnly,
     body: bodyText,
     utf8Bytes: Buffer.byteLength(bodyText, 'utf8'),
     sha256: createHash('sha256').update(bodyText, 'utf8').digest('hex'),
@@ -423,14 +493,14 @@ test('a live dashboard patch cannot restore a snapshot the host invalidated', as
   await page.locator(
     '[data-advice-provider="claude"] [data-advice-action="preview"]',
   ).click();
-  await dispatchHostMessage(page, fixture.snapshotMessages.withPromptSamples);
+  await dispatchHostMessage(page, fixture.snapshotMessages.aggregateOnly);
 
   const preview = page.locator('[data-advice-preview="claude"]');
   const body = preview.locator('[data-advice-preview-body]');
   const send = page.locator(
     '[data-advice-provider="claude"] [data-advice-action="send"]',
   );
-  await expect(body).toContainText(PROMPT_SENTINEL);
+  await expect(body).toHaveText(fixture.snapshotMessages.aggregateOnly.body);
   await expect(send).toBeEnabled();
 
   const discardedCapture = await page.evaluate(() => {
