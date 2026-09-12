@@ -3354,7 +3354,12 @@ export class ClaudeCodeUsageExtension {
     provider: WatcherProvider,
     error: unknown,
   ): void {
-    if (this.disposed || !this.windowActivity.focused) return;
+    if (
+      this.disposed ||
+      this.localDataClearedRequiresReload ||
+      !this.windowActivity.focused ||
+      (provider === 'credentials' && !this.getConfiguration().usageLimitTracking)
+    ) return;
     const state = this.watcherRecoveryState(provider);
     if (state.timer) return;
     const now = Date.now();
@@ -3409,7 +3414,12 @@ export class ClaudeCodeUsageExtension {
       if (lease.active) {
         this.trackResourceStop(lease.stop('settled', () => undefined));
       }
-      if (this.disposed || !this.windowActivity.focused) return;
+      if (
+        this.disposed ||
+        this.localDataClearedRequiresReload ||
+        !this.windowActivity.focused ||
+        (provider === 'credentials' && !this.getConfiguration().usageLimitTracking)
+      ) return;
       if (provider === 'claude') {
         void this.startFileWatching(true);
       } else if (provider === 'codex') {
@@ -3701,11 +3711,21 @@ export class ClaudeCodeUsageExtension {
       this.stopCredentialsWatching('window-blur');
       return;
     }
+    if (!this.getConfiguration().usageLimitTracking) {
+      this.stopCredentialsWatching('feature-disabled');
+      return;
+    }
     this.closeCredentialsWatcher('settings-change');
     const credsPath = this.apiClient.getCredentialsPath();
     const dir = path.dirname(credsPath);
     const name = path.basename(credsPath);
     if (!fs.existsSync(dir)) {
+      if (recoveryAttempt) {
+        // The profile can disappear briefly during an atomic login/profile
+        // replacement. Keep the existing bounded recovery chain alive without
+        // logging the private path or adding a second polling mechanism.
+        this.scheduleWatcherRecovery('credentials', { code: 'ENOENT' });
+      }
       return;
     }
     try {
@@ -3752,6 +3772,7 @@ export class ClaudeCodeUsageExtension {
             'settled',
             'cancelled',
             'window-blur',
+            'feature-disabled',
             'extension-dispose',
             'settings-change',
             'profile-change',
@@ -3775,6 +3796,7 @@ export class ClaudeCodeUsageExtension {
         creator: 'extension',
         stopConditions: [
           'window-blur',
+          'feature-disabled',
           'extension-dispose',
           'settings-change',
           'profile-change',
@@ -3806,6 +3828,7 @@ export class ClaudeCodeUsageExtension {
       ResourceStopCondition,
       | 'cancelled'
       | 'window-blur'
+      | 'feature-disabled'
       | 'extension-dispose'
       | 'settings-change'
       | 'profile-change'
@@ -3842,7 +3865,11 @@ export class ClaudeCodeUsageExtension {
   private stopCredentialsWatching(
     condition: Extract<
       ResourceStopCondition,
-      'window-blur' | 'extension-dispose' | 'settings-change' | 'profile-change'
+      | 'window-blur'
+      | 'feature-disabled'
+      | 'extension-dispose'
+      | 'settings-change'
+      | 'profile-change'
     > = 'settings-change',
   ): void {
     this.resetWatcherRecovery('credentials', condition);

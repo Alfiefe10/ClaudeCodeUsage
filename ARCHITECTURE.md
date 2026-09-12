@@ -284,7 +284,10 @@ debounce (default 30 seconds, configurable to Off/10/30/60/120/300).
 Claude log, Codex log, and Claude credentials-directory watchers all treat
 `fs.watch` as an acceleration path: asynchronous watcher errors close the
 affected handle and use capped exponential re-arming while polling remains the
-fallback. A filename omitted by the operating system is accepted only by the
+fallback. If a failed credentials watcher retries while its profile directory
+is temporarily absent, the same bounded chain continues only while the window
+is focused and quota tracking remains enabled; recreating the directory restores
+one watcher. A filename omitted by the operating system is accepted only by the
 credentials watcher, where the event can represent an atomic credential-file
 replacement and is counted anonymously for diagnosis.
 

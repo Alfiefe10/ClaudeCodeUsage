@@ -36,7 +36,10 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
   rereading JSONL bodies.
 - **Bounded credentials-watcher recovery** — asynchronous failures from the
   Claude credentials-directory watcher now use the same capped exponential
-  re-arm path as the provider log watchers while polling remains available.
+  re-arm path as the provider log watchers while polling remains available. A
+  temporarily absent profile directory no longer breaks that bounded chain,
+  and recovery stops when quota tracking, the window, profile, or extension no
+  longer owns it.
   Anonymous refresh diagnostics count unnamed quota-watcher events, and Codex
   index diagnostics now identify their trigger, watcher/debounce counts, and
   actual backfill/worker mode without paths, filenames, or account data.

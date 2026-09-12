@@ -113,6 +113,36 @@ function bareExtension(): any {
   return extension;
 }
 
+function installManualTimers(): {
+  scheduled: Array<{ id: number; callback: () => void; delayMs: number }>;
+  cleared: number[];
+  restore: () => void;
+} {
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const scheduled: Array<{ id: number; callback: () => void; delayMs: number }> = [];
+  const cleared: number[] = [];
+  let nextId = 0;
+
+  globalThis.setTimeout = ((callback: () => void, milliseconds?: number) => {
+    nextId += 1;
+    scheduled.push({ id: nextId, callback, delayMs: milliseconds ?? 0 });
+    return nextId as unknown as NodeJS.Timeout;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((timer: NodeJS.Timeout) => {
+    cleared.push(timer as unknown as number);
+  }) as typeof clearTimeout;
+
+  return {
+    scheduled,
+    cleared,
+    restore: () => {
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.clearTimeout = originalClearTimeout;
+    },
+  };
+}
+
 test('background transition stops every Claude and Codex recurring resource once', () => {
   const extension = bareExtension();
   const calls: string[] = [];
@@ -1575,6 +1605,7 @@ test('credentials watcher counts unnamed events without exposing filenames', asy
   let listener: ((eventType: string, filename: string | Buffer | null) => void) | undefined;
   let watcherClosed = 0;
   extension.windowActivity = new WindowActivityGate(true);
+  extension.getConfiguration = () => ({ usageLimitTracking: true });
   extension.apiClient = {
     getCredentialsPath: () => path.join(profile, '.credentials.json'),
   };
@@ -1622,6 +1653,7 @@ test('credentials watcher errors reuse bounded recovery and cannot rearm after d
   let watcherClosed = 0;
 
   extension.windowActivity = new WindowActivityGate(true);
+  extension.getConfiguration = () => ({ usageLimitTracking: true });
   extension.outputChannel = { appendLine: (line: string) => diagnostics.push(line) };
   extension.apiClient = {
     getCredentialsPath: () => path.join(profile, '.credentials.json'),
@@ -1687,6 +1719,238 @@ test('credentials watcher errors reuse bounded recovery and cannot rearm after d
     globalThis.setTimeout = originalSetTimeout;
     globalThis.clearTimeout = originalClearTimeout;
     fs.rmSync(profile, { recursive: true, force: true });
+  }
+});
+
+test('credentials watcher recovery keeps one bounded timer across repeated missing-directory retries', async () => {
+  const extension = bareExtension();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ccu-credentials-watch-missing-'));
+  const profile = path.join(root, 'profile');
+  fs.mkdirSync(profile);
+  const originalWatch = fs.watch;
+  const timers = installManualTimers();
+  const errorListeners: Array<(error: Error) => void> = [];
+  const diagnostics: string[] = [];
+  let watchCalls = 0;
+  let watcherClosed = 0;
+
+  extension.windowActivity = new WindowActivityGate(true);
+  extension.getConfiguration = () => ({ usageLimitTracking: true });
+  extension.outputChannel = { appendLine: (line: string) => diagnostics.push(line) };
+  extension.apiClient = {
+    getCredentialsPath: () => path.join(profile, '.credentials.json'),
+  };
+  (fs as any).watch = () => {
+    watchCalls += 1;
+    const watcher = {
+      close: () => { watcherClosed += 1; },
+      on: (event: string, listener: (error: Error) => void) => {
+        if (event === 'error') errorListeners.push(listener);
+        return watcher;
+      },
+    };
+    return watcher;
+  };
+
+  try {
+    extension.startCredentialsWatching();
+    errorListeners[0](Object.assign(new Error('watch failed'), { code: 'EMFILE' }));
+    errorListeners[0](Object.assign(new Error('duplicate stale error'), { code: 'ENOSPC' }));
+    await extension.drainResourceStops();
+    fs.rmSync(profile, { recursive: true, force: true });
+
+    assert.deepEqual(timers.scheduled.map((timer) => timer.delayMs), [1_000]);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.timer, 1);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.watcher, 0);
+
+    timers.scheduled[0].callback();
+    await extension.drainResourceStops();
+    assert.deepEqual(timers.scheduled.map((timer) => timer.delayMs), [1_000, 2_000]);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.timer, 1);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.watcher, 0);
+
+    timers.scheduled[0].callback();
+    timers.scheduled[1].callback();
+    await extension.drainResourceStops();
+    assert.deepEqual(timers.scheduled.map((timer) => timer.delayMs), [1_000, 2_000, 4_000]);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.timer, 1);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.watcher, 0);
+    assert.equal(watchCalls, 1);
+    assert.equal(watcherClosed, 1);
+    assert.doesNotMatch(
+      diagnostics.join('\n'),
+      new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+    );
+  } finally {
+    extension.stopCredentialsWatching();
+    await extension.drainResourceStops();
+    (fs as any).watch = originalWatch;
+    timers.restore();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('credentials watcher recovery restores exactly one watcher after the directory returns', async () => {
+  const extension = bareExtension();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ccu-credentials-watch-return-'));
+  const profile = path.join(root, 'profile');
+  fs.mkdirSync(profile);
+  const originalWatch = fs.watch;
+  const timers = installManualTimers();
+  const errorListeners: Array<(error: Error) => void> = [];
+  let watchCalls = 0;
+  let watcherClosed = 0;
+
+  extension.windowActivity = new WindowActivityGate(true);
+  extension.getConfiguration = () => ({ usageLimitTracking: true });
+  extension.apiClient = {
+    getCredentialsPath: () => path.join(profile, '.credentials.json'),
+  };
+  (fs as any).watch = () => {
+    watchCalls += 1;
+    const watcher = {
+      close: () => { watcherClosed += 1; },
+      on: (event: string, listener: (error: Error) => void) => {
+        if (event === 'error') errorListeners.push(listener);
+        return watcher;
+      },
+    };
+    return watcher;
+  };
+
+  try {
+    extension.startCredentialsWatching();
+    errorListeners[0](Object.assign(new Error('watch failed'), { code: 'EMFILE' }));
+    await extension.drainResourceStops();
+    fs.rmSync(profile, { recursive: true, force: true });
+
+    timers.scheduled[0].callback();
+    await extension.drainResourceStops();
+    fs.mkdirSync(profile);
+    timers.scheduled[1].callback();
+    await extension.drainResourceStops();
+
+    assert.equal(watchCalls, 2);
+    assert.equal(watcherClosed, 1);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.timer, 0);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.watcher, 1);
+
+    timers.scheduled[0].callback();
+    timers.scheduled[1].callback();
+    await extension.drainResourceStops();
+    assert.equal(watchCalls, 2, 'stale retry callbacks cannot create duplicate watchers');
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.watcher, 1);
+  } finally {
+    extension.stopCredentialsWatching();
+    await extension.drainResourceStops();
+    (fs as any).watch = originalWatch;
+    timers.restore();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('credentials watcher recovery stops when quota tracking is disabled before retry', async () => {
+  const extension = bareExtension();
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'ccu-credentials-watch-disabled-'));
+  const originalWatch = fs.watch;
+  const timers = installManualTimers();
+  const errorListeners: Array<(error: Error) => void> = [];
+  let usageLimitTracking = true;
+  let watchCalls = 0;
+
+  extension.windowActivity = new WindowActivityGate(true);
+  extension.getConfiguration = () => ({ usageLimitTracking });
+  extension.apiClient = {
+    getCredentialsPath: () => path.join(profile, '.credentials.json'),
+  };
+  (fs as any).watch = () => {
+    watchCalls += 1;
+    const watcher = {
+      close: () => undefined,
+      on: (event: string, listener: (error: Error) => void) => {
+        if (event === 'error') errorListeners.push(listener);
+        return watcher;
+      },
+    };
+    return watcher;
+  };
+
+  try {
+    extension.startCredentialsWatching();
+    errorListeners[0](Object.assign(new Error('watch failed'), { code: 'EMFILE' }));
+    await extension.drainResourceStops();
+    usageLimitTracking = false;
+
+    timers.scheduled[0].callback();
+    await extension.drainResourceStops();
+    assert.equal(watchCalls, 1);
+    assert.equal(timers.scheduled.length, 1, 'disabled quota tracking cannot schedule another retry');
+    assert.equal(extension.resourceOwnership.snapshotForTests().activeCount, 0);
+  } finally {
+    extension.stopCredentialsWatching();
+    await extension.drainResourceStops();
+    (fs as any).watch = originalWatch;
+    timers.restore();
+    fs.rmSync(profile, { recursive: true, force: true });
+  }
+});
+
+test('credentials watcher recovery callbacks stay cancelled after blur, profile switch, and disposal', async (t) => {
+  for (const scenario of [
+    { name: 'window blur', condition: 'window-blur', deactivate: (extension: any) => extension.windowActivity.update(false) },
+    { name: 'profile switch', condition: 'profile-change', deactivate: () => undefined },
+    { name: 'extension disposal', condition: 'extension-dispose', deactivate: (extension: any) => { extension.disposed = true; } },
+  ] as const) {
+    await t.test(scenario.name, async () => {
+      const extension = bareExtension();
+      const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'ccu-credentials-watch-cancel-'));
+      const originalWatch = fs.watch;
+      const timers = installManualTimers();
+      const errorListeners: Array<(error: Error) => void> = [];
+      let watchCalls = 0;
+
+      extension.windowActivity = new WindowActivityGate(true);
+      extension.getConfiguration = () => ({ usageLimitTracking: true });
+      extension.apiClient = {
+        getCredentialsPath: () => path.join(profile, '.credentials.json'),
+      };
+      (fs as any).watch = () => {
+        watchCalls += 1;
+        const watcher = {
+          close: () => undefined,
+          on: (event: string, listener: (error: Error) => void) => {
+            if (event === 'error') errorListeners.push(listener);
+            return watcher;
+          },
+        };
+        return watcher;
+      };
+
+      try {
+        extension.startCredentialsWatching();
+        errorListeners[0](Object.assign(new Error('watch failed'), { code: 'EMFILE' }));
+        await extension.drainResourceStops();
+        const staleRetry = timers.scheduled[0].callback;
+
+        scenario.deactivate(extension);
+        extension.stopCredentialsWatching(scenario.condition);
+        await extension.drainResourceStops();
+        staleRetry();
+        await extension.drainResourceStops();
+
+        assert.equal(watchCalls, 1);
+        assert.deepEqual(timers.cleared, [1]);
+        assert.equal(extension.resourceOwnership.snapshotForTests().activeCount, 0);
+      } finally {
+        extension.stopCredentialsWatching(
+          scenario.condition === 'extension-dispose' ? 'extension-dispose' : 'settings-change',
+        );
+        await extension.drainResourceStops();
+        (fs as any).watch = originalWatch;
+        timers.restore();
+        fs.rmSync(profile, { recursive: true, force: true });
+      }
+    });
   }
 });
 
