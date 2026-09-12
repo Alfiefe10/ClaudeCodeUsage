@@ -79,6 +79,12 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
 - **Claude calendar rollover** — unchanged histories now republish Today and
   the rolling 30-day snapshot at configured-timezone midnight without
   rereading JSONL bodies.
+- **Bounded credentials-watcher recovery** — asynchronous failures from the
+  Claude credentials-directory watcher now use the same capped exponential
+  re-arm path as the provider log watchers while polling remains available.
+  Anonymous refresh diagnostics count unnamed quota-watcher events, and Codex
+  index diagnostics now identify their trigger, watcher/debounce counts, and
+  actual backfill/worker mode without paths, filenames, or account data.
 - **Resilient provider watchers** — failed Claude or Codex watchers re-arm with
   bounded exponential backoff while polling remains available; recovery and
   disposal cannot create a retry hot loop.

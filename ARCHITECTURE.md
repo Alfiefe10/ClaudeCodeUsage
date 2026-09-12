@@ -198,7 +198,12 @@ from user-draft Optimizer calls. Cancellation cannot recall transmitted bytes.
 
 The machine salt lives in VS Code `globalState`, not in the index file. Worker
 progress/results/errors and diagnostics contain anonymous counts and timings,
-not paths or identifiers.
+not paths or identifiers. `refresh:` diagnostics include the bounded trigger,
+Claude-watcher/coalescing counters, and the count of quota-watcher events for
+which the operating system supplied no filename. `codex-index` diagnostics add
+the actual refresh trigger, watcher/debounce counts, historical-backfill mode,
+and foreground/background worker profile; generic failure paths use `unknown`
+rather than infer a mode that was not observed.
 
 ### Schema 3 index contract
 
@@ -276,6 +281,12 @@ cross-file response-identity rules are updated through the same atomic path.
 A new Extension Host performs one cold in-memory build; watcher-driven refreshes
 do not reread and reaggregate the complete corpus. Codex uses its own quiet
 debounce (default 30 seconds, configurable to Off/10/30/60/120/300).
+Claude log, Codex log, and Claude credentials-directory watchers all treat
+`fs.watch` as an acceleration path: asynchronous watcher errors close the
+affected handle and use capped exponential re-arming while polling remains the
+fallback. A filename omitted by the operating system is accepted only by the
+credentials watcher, where the event can represent an atomic credential-file
+replacement and is counted anonymously for diagnosis.
 
 Codex history is designed for multi-gigabyte local corpora:
 

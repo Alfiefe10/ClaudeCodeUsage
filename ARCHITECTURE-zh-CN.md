@@ -161,7 +161,10 @@ Advice 同意变更会立即作废 Prepared handle。host 的 pending-write 计�
 owner 取消在途建议请求，与仅含用户草稿的 Optimizer 请求隔离。取消不能追回已传出的字节。
 
 Machine salt 存在 VS Code `globalState`，不写入索引。Worker progress/result/error 与 diagnostics
-只含匿名计数与时间，不含 path 或 ID。
+只含匿名计数与时间，不含 path 或 ID。`refresh:` diagnostics 包含受限的 trigger、Claude
+watcher/coalescing 计数，以及操作系统未提供 filename 的 quota watcher 事件数。`codex-index`
+diagnostics 还会记录实际 refresh trigger、watcher/debounce 计数、历史 backfill 模式与
+foreground/background worker profile；通用失败路径无法确认模式时明确记为 `unknown`，不作猜测。
 
 ### Schema 3 索引契约
 
@@ -214,6 +217,10 @@ append 只读已验证 tail，truncate/replace/move/delete 只重建受影响文
 内容分析 contribution 与既有跨文件 response-identity 规则通过同一原子路径更新。新的
 Extension Host 会执行一次冷内存建索引；watcher 驱动的刷新不会重读、重聚合整个语料。
 Codex 使用独立 quiet debounce（默认 30 秒，可选 Off/10/30/60/120/300）。
+Claude log、Codex log 与 Claude credentials directory watcher 都只作为 `fs.watch` 加速路径：
+异步 watcher error 会关闭受影响 handle，并在 polling 继续可用时按有上限的指数退避重新挂载。
+只有 credentials watcher 接受操作系统省略 filename 的事件，因为这可能表示 credential file
+被原子替换；该类事件仅以匿名计数进入诊断。
 
 Codex 按多 GiB 本地历史设计：
 
