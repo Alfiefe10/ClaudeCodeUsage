@@ -30,13 +30,17 @@ async function dispatchHostMessage(page, message) {
   }, message);
 }
 
-async function dispatchDashboardDataPatch(page, provider, revision = 1) {
+async function dispatchDashboardDataPatch(
+  page,
+  provider,
+  { revision = 1, adviceSnapshotIds = {} } = {},
+) {
   const url = new URL(page.url());
   url.searchParams.set('provider', provider);
   url.searchParams.set('fixture', 'advice-effectiveness');
   const response = await page.context().request.get(url.toString());
   const documentText = await response.text();
-  await page.evaluate(({ nextProvider, nextRevision, documentText }) => {
+  await page.evaluate(({ nextProvider, nextRevision, nextAdviceSnapshotIds, documentText }) => {
     const activeTab = document.querySelector('.tabs [role="tab"].active')
       ?.id.replace('tab-', '');
     if (!activeTab) throw new Error('Current dashboard did not expose an active tab');
@@ -51,9 +55,15 @@ async function dispatchDashboardDataPatch(page, provider, revision = 1) {
         revision: nextRevision,
         html: nextPanel.innerHTML,
         claudeLast30HoursByDay: {},
+        adviceSnapshotIds: nextAdviceSnapshotIds,
       },
     }));
-  }, { nextProvider: provider, nextRevision: revision, documentText });
+  }, {
+    nextProvider: provider,
+    nextRevision: revision,
+    nextAdviceSnapshotIds: adviceSnapshotIds,
+    documentText,
+  });
 }
 
 async function postedMessages(page, command) {
@@ -390,7 +400,9 @@ test('a live dashboard patch preserves vertical position inside the advice paylo
     body: bodyText,
   });
 
-  await dispatchDashboardDataPatch(page, 'claude');
+  await dispatchDashboardDataPatch(page, 'claude', {
+    adviceSnapshotIds: { claude: snapshotMessage.snapshotId },
+  });
   await expectPostedCount(page, 'dashboardDataPatchAck', 1);
   expect((await postedMessages(page, 'dashboardDataPatchAck')).at(-1)).toEqual({
     command: 'dashboardDataPatchAck',
@@ -402,6 +414,47 @@ test('a live dashboard patch preserves vertical position inside the advice paylo
   await expect(refreshed).toBeVisible();
   await expect.poll(() => refreshed.evaluate((element) => element.scrollTop))
     .toBe(before.scrollTop);
+});
+
+test('a live dashboard patch cannot restore a snapshot the host invalidated', async ({ page }) => {
+  const fixture = buildAdviceEffectivenessFixture({ locale: 'en' });
+  await openCandidate(page, 'claude');
+  await grantAggregateConsent(page);
+  await page.locator(
+    '[data-advice-provider="claude"] [data-advice-action="preview"]',
+  ).click();
+  await dispatchHostMessage(page, fixture.snapshotMessages.withPromptSamples);
+
+  const preview = page.locator('[data-advice-preview="claude"]');
+  const body = preview.locator('[data-advice-preview-body]');
+  const send = page.locator(
+    '[data-advice-provider="claude"] [data-advice-action="send"]',
+  );
+  await expect(body).toContainText(PROMPT_SENTINEL);
+  await expect(send).toBeEnabled();
+
+  const discardedCapture = await page.evaluate(() => {
+    const panel = document.getElementById('provider-panel');
+    const previews = globalThis.ccuCaptureRefreshContext(panel).advicePreviews;
+    globalThis.ccuRestoreAdvicePreviews(previews, {});
+    return previews[0];
+  });
+  expect(discardedCapture).toMatchObject({
+    body: '',
+    digest: '',
+    sendText: '',
+    statusText: '',
+  });
+
+  await dispatchDashboardDataPatch(page, 'claude');
+
+  await expect(page.locator(
+    '[data-advice-provider="claude"] [data-advice-consent-kind="aggregate"]',
+  )).not.toBeChecked();
+  await expect(preview).toBeHidden();
+  await expect(body).toHaveText('');
+  await expect(send).toBeDisabled();
+  expect(await postedMessages(page, 'sendAdviceSnapshot')).toEqual([]);
 });
 
 test('candidate exposes only bounded advice actions and feedback posts identifiers plus kind only', async ({ page }) => {

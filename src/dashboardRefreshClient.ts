@@ -267,14 +267,45 @@ function ccuCaptureAdvicePreviews(panel) {
   return previews;
 }
 
-function ccuRestoreAdvicePreviews(previews) {
+function ccuValidatedAdviceSnapshotIds(value) {
+  var active = {};
+  if (!value || Object.prototype.toString.call(value) !== '[object Object]') {
+    return active;
+  }
+  ['claude', 'codex'].forEach(function(provider) {
+    var snapshotId = value[provider];
+    if (typeof snapshotId === 'string' && /^snapshot-[a-f0-9]{24}$/.test(snapshotId)) {
+      active[provider] = snapshotId;
+    }
+  });
+  return active;
+}
+
+function ccuDiscardCapturedAdvicePreview(saved) {
+  if (!saved || typeof saved !== 'object') { return; }
+  saved.body = '';
+  saved.digest = '';
+  saved.mode = '';
+  saved.contentType = '';
+  saved.bytes = '';
+  saved.count = '';
+  saved.sendText = '';
+  saved.statusText = '';
+}
+
+function ccuRestoreAdvicePreviews(previews, adviceSnapshotIds) {
+  var active = ccuValidatedAdviceSnapshotIds(adviceSnapshotIds);
   (previews || []).forEach(function(saved) {
     if (
       !saved ||
       (saved.provider !== 'claude' && saved.provider !== 'codex') ||
       typeof saved.snapshotId !== 'string' ||
-      !/^snapshot-[a-f0-9]{24}$/.test(saved.snapshotId)
-    ) { return; }
+      !/^snapshot-[a-f0-9]{24}$/.test(saved.snapshotId) ||
+      active[saved.provider] !== saved.snapshotId
+    ) {
+      ccuDiscardCapturedAdvicePreview(saved);
+      return;
+    }
     var elements = adviceConsentElements(saved.provider);
     if (!elements.preview) { return; }
     var preview = elements.preview;
@@ -406,7 +437,7 @@ function ccuRestoreRefreshPosition(context, panel) {
   });
 }
 
-function ccuRestoreDashboardUiAfterPatch(context, panel, tab) {
+function ccuRestoreDashboardUiAfterPatch(context, panel, tab, adviceSnapshotIds) {
   try { localStorage.setItem('ccu.activeTab', tab); } catch (e) {}
   showTab(tab, true);
   restoreSessionFilter();
@@ -424,7 +455,7 @@ function ccuRestoreDashboardUiAfterPatch(context, panel, tab) {
   restoreProjectMatrixState(panel);
   ccuRestoreTransientControls(context, panel);
   restoreAdviceEffectivenessState();
-  ccuRestoreAdvicePreviews(context.advicePreviews);
+  ccuRestoreAdvicePreviews(context.advicePreviews, adviceSnapshotIds);
   formatOptSettings();
   requestLocalDataInventoryForVisibleSettings();
   ccuRestoreRefreshPosition(context, panel);
@@ -463,7 +494,7 @@ function ccuApplyDashboardDataPatch(message) {
     panel.innerHTML = message.html;
     __claudeLast30HoursByDay = message.claudeLast30HoursByDay;
     __ccuLastDashboardPatchRevision = revision;
-    ccuRestoreDashboardUiAfterPatch(context, panel, message.tab);
+    ccuRestoreDashboardUiAfterPatch(context, panel, message.tab, message.adviceSnapshotIds);
     vscode.postMessage({ command: 'dashboardDataPatchAck', revision: revision, ok: true });
     return true;
   } catch (e) {

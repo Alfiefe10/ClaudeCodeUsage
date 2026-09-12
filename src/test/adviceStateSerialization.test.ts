@@ -113,6 +113,35 @@ async function preparedProvider(storage: AdviceLocalStateStorage, initial: Advic
   return { provider, snapshotId, messages };
 }
 
+test('live dashboard patches expose only host-current sealed preview IDs', async () => {
+  const initial = grantedState(true);
+  const storage = new ControlledStorage(initial);
+  const { provider, snapshotId } = await preparedProvider(storage, initial);
+  provider.currentProvider = 'claude';
+  provider.currentTab = 'content';
+  provider.hourlyDataForRolling30DaysByDay = {};
+
+  const documentHtml = [
+    '<!DOCTYPE html>',
+    '<!-- ccu-live-panel:start --><section>fresh</section><!-- ccu-live-panel:end -->',
+    '<script>const hours = /* ccu-live-hours:start */{}/* ccu-live-hours:end */;</script>',
+  ].join('');
+  const validPatch = provider.dashboardLivePatchFor(documentHtml);
+  assert.ok(validPatch);
+  assert.deepEqual(validPatch.adviceSnapshotIds, { claude: snapshotId });
+
+  provider.adviceConsentWritesPending = 1;
+  const pendingConsentPatch = provider.dashboardLivePatchFor(documentHtml);
+  assert.ok(pendingConsentPatch);
+  assert.deepEqual(pendingConsentPatch.adviceSnapshotIds, {});
+  provider.adviceConsentWritesPending = 0;
+
+  provider.adviceConsentGeneration += 1;
+  const stalePatch = provider.dashboardLivePatchFor(documentHtml);
+  assert.ok(stalePatch);
+  assert.deepEqual(stalePatch.adviceSnapshotIds, {});
+});
+
 test('withdrawal rejects an old preview before its durable consent write completes', async () => {
   const initial = grantedState();
   const storage = new ControlledStorage(initial);

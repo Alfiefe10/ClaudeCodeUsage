@@ -241,6 +241,7 @@ interface DashboardLivePatch {
   panelHtml: string;
   structureKey: string;
   claudeLast30HoursByDay: ReturnType<typeof claudeHourlyDisplayDto>;
+  adviceSnapshotIds: Partial<Record<AdviceEffectivenessProvider, string>>;
 }
 
 interface PendingDashboardLivePatch extends DashboardLivePatch {
@@ -1198,6 +1199,48 @@ export class UsageWebviewProvider {
         this.preparedAdviceSnapshots.delete(snapshotId);
       }
     }
+  }
+
+  /**
+   * Only the extension host can decide whether a sealed preview is still
+   * authorized. The webview receives opaque IDs for the currently valid
+   * previews and must discard any captured DOM content that is not listed.
+   */
+  private activeAdviceSnapshotIds(): Partial<Record<AdviceEffectivenessProvider, string>> {
+    const active: Partial<Record<AdviceEffectivenessProvider, string>> = {};
+    const ambiguous = new Set<AdviceEffectivenessProvider>();
+    if (
+      this.adviceLocalStateStatus !== 'ready' ||
+      this.adviceConsentWritesPending > 0 ||
+      this.adviceLocalState.aggregateConsent !== 'explicit'
+    ) {
+      return active;
+    }
+    for (const [snapshotId, stored] of this.preparedAdviceSnapshots) {
+      const providerState = this.adviceProviderState(stored.provider);
+      if (
+        !providerState ||
+        stored.provider !== providerState.provider ||
+        stored.sourceRevision !== this.adviceSourceRevision(providerState) ||
+        stored.consentGeneration !== this.adviceConsentGeneration ||
+        (stored.snapshot.preview.promptSampleCount > 0 &&
+          this.adviceLocalState.promptSampleConsent !== 'explicit')
+      ) {
+        continue;
+      }
+      // More than one valid snapshot for one provider violates the sealing
+      // invariant. Fail closed instead of choosing one by insertion order.
+      if (ambiguous.has(stored.provider)) {
+        continue;
+      }
+      if (active[stored.provider] !== undefined) {
+        delete active[stored.provider];
+        ambiguous.add(stored.provider);
+        continue;
+      }
+      active[stored.provider] = snapshotId;
+    }
+    return active;
   }
 
   /** Opaque content revision; no path/session/title is retained or exposed. */
@@ -2692,6 +2735,7 @@ export class UsageWebviewProvider {
       claudeLast30HoursByDay: claudeHourlyDisplayDto(
         this.hourlyDataForRolling30DaysByDay,
       ),
+      adviceSnapshotIds: this.activeAdviceSnapshotIds(),
     };
   }
 
@@ -2731,6 +2775,7 @@ export class UsageWebviewProvider {
         revision: latest.revision,
         html: latest.panelHtml,
         claudeLast30HoursByDay: latest.claudeLast30HoursByDay,
+        adviceSnapshotIds: latest.adviceSnapshotIds,
       })).then((delivered) => {
         if (delivered === false) {
           this.replaceDocumentAfterPatchFailure(latest);
