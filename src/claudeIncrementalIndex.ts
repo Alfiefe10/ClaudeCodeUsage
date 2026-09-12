@@ -87,6 +87,11 @@ interface ResolvedToolBucket {
   firstEvent: TaggedAnalysisToolEvent;
 }
 
+interface ToolBucketContributor {
+  toolId: string;
+  firstEvent: TaggedAnalysisToolEvent;
+}
+
 interface AnalysisCalibration {
   realOutputTokens: number;
   realInputSideTokens: number;
@@ -112,6 +117,7 @@ interface AnalysisRuntimeState {
   toolEventsById: ReadonlyMap<string, readonly TaggedAnalysisToolEvent[]>;
   toolBucketsById: ReadonlyMap<string, ReadonlyMap<string, ResolvedToolBucket>>;
   firstToolResultByName: ReadonlyMap<string, TaggedAnalysisToolEvent>;
+  toolContributorsByName: ReadonlyMap<string, readonly ToolBucketContributor[]>;
 }
 
 const analysisRuntimeByIndex = new WeakMap<ClaudeUsageIndex, AnalysisRuntimeState>();
@@ -695,11 +701,15 @@ function materializeToolBuckets(
   target: AnalysisAcc,
   bucketsById: ReadonlyMap<string, ReadonlyMap<string, ResolvedToolBucket>>,
   orderedFileIds: readonly string[],
-): Map<string, TaggedAnalysisToolEvent> {
+): {
+  firstByName: Map<string, TaggedAnalysisToolEvent>;
+  contributorsByName: Map<string, readonly ToolBucketContributor[]>;
+} {
   const totals = new Map<string, AnalysisBucket>();
   const firstByName = new Map<string, TaggedAnalysisToolEvent>();
+  const contributorsByName = new Map<string, ToolBucketContributor[]>();
   const compare = taggedOrder(orderedFileIds);
-  for (const buckets of bucketsById.values()) {
+  for (const [toolId, buckets] of bucketsById) {
     for (const [name, resolved] of buckets) {
       const total = totals.get(name) ?? { tokens: 0, chars: 0, count: 0 };
       total.tokens += resolved.bucket.tokens;
@@ -710,6 +720,9 @@ function materializeToolBuckets(
       if (!first || compare(resolved.firstEvent, first) < 0) {
         firstByName.set(name, resolved.firstEvent);
       }
+      const contributors = contributorsByName.get(name) ?? [];
+      contributors.push({ toolId, firstEvent: resolved.firstEvent });
+      contributorsByName.set(name, contributors);
     }
   }
   target.tools = {};
@@ -717,7 +730,11 @@ function materializeToolBuckets(
     compare(firstByName.get(left[0])!, firstByName.get(right[0])!))) {
     target.tools[name] = bucket;
   }
-  return firstByName;
+  for (const contributors of contributorsByName.values()) {
+    contributors.sort((left, right) =>
+      compare(left.firstEvent, right.firstEvent) || left.toolId.localeCompare(right.toolId));
+  }
+  return { firstByName, contributorsByName };
 }
 
 function resolveSkillPreambles(
@@ -731,8 +748,9 @@ function resolveSkillPreambles(
     entry.value = { ...entry.baseValue };
     entry.preambleCount = 0;
   }
-  for (const [toolId, events] of eventsById) {
-    if (onlyToolIds && !onlyToolIds.has(toolId)) continue;
+  const toolIds: Iterable<string> = onlyToolIds ?? eventsById.keys();
+  for (const toolId of toolIds) {
+    const events = eventsById.get(toolId) ?? [];
     let active: TaggedAnalysisSkillUse | undefined;
     for (const event of events) {
       if (event.value.kind === 'tool-use') {
@@ -844,7 +862,7 @@ function buildAnalysisRuntimeState(
   for (const [toolId, events] of toolEventsById) {
     toolBucketsById.set(toolId, resolveToolBuckets(events));
   }
-  const firstToolResultByName = materializeToolBuckets(
+  const toolMaterialization = materializeToolBuckets(
     merged,
     toolBucketsById,
     orderedFileIds,
@@ -868,7 +886,8 @@ function buildAnalysisRuntimeState(
     firstUuidFileByUuid,
     toolEventsById,
     toolBucketsById,
-    firstToolResultByName,
+    firstToolResultByName: toolMaterialization.firstByName,
+    toolContributorsByName: toolMaterialization.contributorsByName,
   };
 }
 
@@ -994,6 +1013,46 @@ function refreshedSkillHead(
   return candidates.slice(0, ANALYSIS_SKILL_USE_LIMIT);
 }
 
+function resolvedBucketRecord(
+  buckets: ReadonlyMap<string, ResolvedToolBucket> | undefined,
+): Record<string, AnalysisBucket> {
+  return Object.fromEntries(
+    [...(buckets ?? [])].map(([name, value]) => [name, value.bucket]),
+  );
+}
+
+function lowerBoundContributor(
+  values: readonly ToolBucketContributor[],
+  target: ToolBucketContributor,
+  compare: (left: ToolBucketContributor, right: ToolBucketContributor) => number,
+): number {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    if (compare(values[middle], target) < 0) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function reorderToolBuckets(
+  target: AnalysisAcc,
+  firstByName: ReadonlyMap<string, TaggedAnalysisToolEvent>,
+  orderedFileIds: readonly string[],
+): void {
+  const compare = taggedOrder(orderedFileIds);
+  const ordered = Object.entries(target.tools).sort(([left], [right]) => {
+    const leftEvent = firstByName.get(left);
+    const rightEvent = firstByName.get(right);
+    if (leftEvent && rightEvent) return compare(leftEvent, rightEvent);
+    if (leftEvent) return -1;
+    if (rightEvent) return 1;
+    return left.localeCompare(right);
+  });
+  target.tools = Object.fromEntries(ordered);
+}
+
 function refreshedStructuralRuntime(
   state: AnalysisRuntimeState,
   merged: AnalysisAcc,
@@ -1001,26 +1060,74 @@ function refreshedStructuralRuntime(
   touchedToolIds: ReadonlySet<string>,
 ): Pick<
   AnalysisRuntimeState,
-  'skillHead' | 'toolEventsById' | 'toolBucketsById' | 'firstToolResultByName'
+  'skillHead' | 'toolEventsById' | 'toolBucketsById' |
+  'firstToolResultByName' | 'toolContributorsByName'
 > {
   const changedFileIds = new Set(appended.keys());
   const compare = taggedOrder(state.orderedFileIds);
+  const compareContributor = (left: ToolBucketContributor, right: ToolBucketContributor): number =>
+    compare(left.firstEvent, right.firstEvent) || left.toolId.localeCompare(right.toolId);
   const toolEventsById = new Map(state.toolEventsById);
   const toolBucketsById = new Map(state.toolBucketsById);
+  const toolContributorsByName = new Map(state.toolContributorsByName);
+  const copiedContributorNames = new Set<string>();
+  const affectedToolNames = new Set<string>();
+  const appendedEventsById = new Map<string, TaggedAnalysisToolEvent[]>();
+  for (const [fileId, analysis] of appended) {
+    for (const [position, event] of (analysis.structuralEvents ?? []).entries()) {
+      if (event.kind === 'command' || !touchedToolIds.has(event.toolId)) continue;
+      const events = appendedEventsById.get(event.toolId) ?? [];
+      events.push({ fileId, position, value: event });
+      appendedEventsById.set(event.toolId, events);
+    }
+  }
+  const writableContributors = (name: string): ToolBucketContributor[] => {
+    const existing = toolContributorsByName.get(name);
+    if (copiedContributorNames.has(name) && existing) {
+      return existing as ToolBucketContributor[];
+    }
+    const copied = [...(existing ?? [])];
+    toolContributorsByName.set(name, copied);
+    copiedContributorNames.add(name);
+    return copied;
+  };
+  const removeContributor = (name: string, contributor: ToolBucketContributor): void => {
+    const values = writableContributors(name);
+    const index = lowerBoundContributor(values, contributor, compareContributor);
+    if (index < values.length && compareContributor(values[index], contributor) === 0) {
+      values.splice(index, 1);
+    }
+    if (values.length === 0) toolContributorsByName.delete(name);
+    affectedToolNames.add(name);
+  };
+  const addContributor = (name: string, contributor: ToolBucketContributor): void => {
+    const values = writableContributors(name);
+    const index = lowerBoundContributor(values, contributor, compareContributor);
+    values.splice(index, 0, contributor);
+    affectedToolNames.add(name);
+  };
   for (const toolId of touchedToolIds) {
+    const priorBuckets = state.toolBucketsById.get(toolId);
     const events = (state.toolEventsById.get(toolId) ?? [])
       .filter((event) => !changedFileIds.has(event.fileId))
       .map((event) => ({ ...event, value: { ...event.value } } as TaggedAnalysisToolEvent));
-    for (const [fileId, analysis] of appended) {
-      for (const [position, event] of (analysis.structuralEvents ?? []).entries()) {
-        if (event.kind === 'command' || event.toolId !== toolId) continue;
-        events.push({ fileId, position, value: event });
-      }
-    }
+    events.push(...(appendedEventsById.get(toolId) ?? []));
     events.sort(compare);
+    const nextBuckets = resolveToolBuckets(events);
+    addBucketDelta(
+      merged.tools,
+      resolvedBucketRecord(priorBuckets),
+      resolvedBucketRecord(nextBuckets),
+    );
+    for (const [name, value] of priorBuckets ?? []) {
+      removeContributor(name, { toolId, firstEvent: value.firstEvent });
+    }
+    for (const [name, value] of nextBuckets) {
+      addContributor(name, { toolId, firstEvent: value.firstEvent });
+    }
     if (events.length > 0) {
       toolEventsById.set(toolId, events);
-      toolBucketsById.set(toolId, resolveToolBuckets(events));
+      toolBucketsById.set(toolId, nextBuckets);
     } else {
       toolEventsById.delete(toolId);
       toolBucketsById.delete(toolId);
@@ -1060,12 +1167,20 @@ function refreshedStructuralRuntime(
   }
   resolveSkillPreambles(skillHead, toolEventsById, affectedSkillToolIds);
 
-  const firstToolResultByName = materializeToolBuckets(
-    merged,
+  const firstToolResultByName = new Map(state.firstToolResultByName);
+  for (const name of affectedToolNames) {
+    const first = toolContributorsByName.get(name)?.[0]?.firstEvent;
+    if (first) firstToolResultByName.set(name, first);
+    else firstToolResultByName.delete(name);
+  }
+  reorderToolBuckets(merged, firstToolResultByName, state.orderedFileIds);
+  return {
+    skillHead,
+    toolEventsById,
     toolBucketsById,
-    state.orderedFileIds,
-  );
-  return { skillHead, toolEventsById, toolBucketsById, firstToolResultByName };
+    firstToolResultByName,
+    toolContributorsByName,
+  };
 }
 
 function appendCalibration(
@@ -2832,6 +2947,7 @@ export async function updateClaudeUsageIndex(
       toolEventsById: structural.toolEventsById,
       toolBucketsById: structural.toolBucketsById,
       firstToolResultByName: structural.firstToolResultByName,
+      toolContributorsByName: structural.toolContributorsByName,
     };
     analysisRuntimeByIndex.set(next, runtime);
     next.contentAnalysis = finalizeMaterializedAnalysis(runtime);
