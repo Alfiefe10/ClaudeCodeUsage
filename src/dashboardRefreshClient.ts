@@ -21,6 +21,36 @@ var __ccuRefreshIdentityAttributes = [
   'name'
 ];
 var __ccuFocusableSelector = 'a[href],button,input,select,textarea,summary,[tabindex]';
+var __ccuRefreshScrollerKinds = [
+  ['dashboard-tabs', '.tabs'],
+  ['chart', '.hc-scroll'],
+  ['table', '.daily-table-container'],
+  ['project-heatmap', '.project-matrix-scroll'],
+  ['project-trend', '.project-matrix-trend-scroll'],
+  ['local-data-table', '.local-data-table-wrap'],
+  ['heatmap', '.heatmap-svg'],
+  ['share-preview', '.share-preview'],
+  ['advice-preview', '.advice-payload-preview pre']
+];
+var __ccuRefreshScrollerSelector = __ccuRefreshScrollerKinds
+  .map(function(entry) { return entry[1]; })
+  .join(',');
+var __ccuRefreshScrollLandmarkAttributes = [
+  'data-project-matrix',
+  'data-project-matrix-range-panel',
+  'data-project-matrix-heatmap',
+  'data-project-matrix-trend',
+  'data-codex-time-series',
+  'data-codex-last30-daily',
+  'data-claude-last30-daily',
+  'data-last30-daily',
+  'data-codex-alltime-daily',
+  'data-codex-today-hourly',
+  'data-hourly-overview',
+  'data-advice-provider',
+  'data-date',
+  'data-month'
+];
 
 function ccuRefreshScope(element, panel) {
   var tab = element && element.closest ? element.closest('.tab-content[id]') : null;
@@ -98,6 +128,99 @@ function ccuResolveRefreshDescriptor(descriptor, panel) {
   return matches[descriptor.occurrence] || null;
 }
 
+function ccuRefreshSafeScrollLandmark(attribute, value) {
+  if (attribute === 'data-project-matrix') {
+    return value === 'claude' || value === 'codex' ? value : '';
+  }
+  if (attribute === 'data-project-matrix-range-panel') {
+    return value === '30' || value === '90' ? value : '';
+  }
+  if (attribute === 'data-advice-provider') {
+    return value === 'claude' || value === 'codex' || value === 'optimizer' ? value : '';
+  }
+  if (attribute === 'data-date') {
+    return /^\\d{4}-\\d{2}-\\d{2}$/.test(value) ? value : '';
+  }
+  if (attribute === 'data-month') {
+    return /^\\d{4}-\\d{2}$/.test(value) ? value : '';
+  }
+  return value === '' ? 'present' : '';
+}
+
+function ccuRefreshScrollerBaseKey(element, panel) {
+  if (!element || !element.matches) { return ''; }
+  var scope = ccuRefreshScope(element, panel);
+  var allowedScopeIds = [
+    'today', 'month', 'all', 'sessions', 'projects', 'content',
+    'branches', 'workflows', 'settings'
+  ];
+  var scopeId = scope !== panel && allowedScopeIds.indexOf(scope.id) !== -1
+    ? scope.id
+    : 'provider-panel';
+  var kind = '';
+  for (var i = 0; i < __ccuRefreshScrollerKinds.length; i += 1) {
+    if (element.matches(__ccuRefreshScrollerKinds[i][1])) {
+      kind = __ccuRefreshScrollerKinds[i][0];
+      break;
+    }
+  }
+  if (!kind) { return ''; }
+  var landmarks = [];
+  var owner = element;
+  while (owner && owner !== scope.parentElement) {
+    for (var j = 0; j < __ccuRefreshScrollLandmarkAttributes.length; j += 1) {
+      var attribute = __ccuRefreshScrollLandmarkAttributes[j];
+      if (!owner.hasAttribute(attribute)) { continue; }
+      var safeValue = ccuRefreshSafeScrollLandmark(attribute, owner.getAttribute(attribute) || '');
+      if (safeValue) { landmarks.push(attribute + '=' + safeValue); }
+    }
+    if (owner === scope) { break; }
+    owner = owner.parentElement;
+  }
+  return scopeId + '|' + kind + '|' + landmarks.join('/');
+}
+
+function ccuRefreshScrollerEntries(panel) {
+  var occurrences = {};
+  var entries = [];
+  Array.prototype.forEach.call(
+    panel.querySelectorAll(__ccuRefreshScrollerSelector),
+    function(scroller) {
+      var baseKey = ccuRefreshScrollerBaseKey(scroller, panel);
+      if (!baseKey) { return; }
+      var occurrence = occurrences[baseKey] || 0;
+      occurrences[baseKey] = occurrence + 1;
+      entries.push({ scroller: scroller, key: baseKey + '|' + occurrence });
+    },
+  );
+  return entries;
+}
+
+function ccuCaptureLocalScrollPositions(panel) {
+  var positions = [];
+  ccuRefreshScrollerEntries(panel).forEach(function(entry) {
+    var scroller = entry.scroller;
+    if (!(scroller.scrollLeft > 0)) { return; }
+    positions.push({ key: entry.key, scrollLeft: scroller.scrollLeft });
+  });
+  return positions;
+}
+
+function ccuRestoreLocalScrollPositions(positions, panel) {
+  if (!positions || positions.length === 0) { return; }
+  var saved = {};
+  positions.forEach(function(position) {
+    if (position && typeof position.key === 'string' && typeof position.scrollLeft === 'number') {
+      saved[position.key] = position.scrollLeft;
+    }
+  });
+  ccuRefreshScrollerEntries(panel).forEach(function(entry) {
+    if (Object.prototype.hasOwnProperty.call(saved, entry.key)) {
+      entry.scroller.scrollLeft = saved[entry.key];
+    }
+  });
+}
+
 function ccuCaptureRefreshAnchor(panel, focusedDescriptor) {
   var focused = focusedDescriptor ? ccuResolveRefreshDescriptor(focusedDescriptor, panel) : null;
   if (focused) {
@@ -156,6 +279,7 @@ function ccuCaptureRefreshContext(panel) {
     focus: focus,
     anchor: ccuCaptureRefreshAnchor(panel, focus),
     controls: controls,
+    localScrollPositions: ccuCaptureLocalScrollPositions(panel),
     scrollY: window.scrollY
   };
 }
@@ -187,10 +311,12 @@ function ccuRestoreRefreshPosition(context, panel) {
       } else {
         window.scrollTo(0, context.scrollY);
       }
+      ccuRestoreLocalScrollPositions(context.localScrollPositions, panel);
       var focused = ccuResolveRefreshDescriptor(context.focus, panel);
       if (focused && typeof focused.focus === 'function') {
         try { focused.focus({ preventScroll: true }); } catch (e) { focused.focus(); }
       }
+      ccuRestoreLocalScrollPositions(context.localScrollPositions, panel);
       if (anchor) {
         window.scrollBy(0, anchor.getBoundingClientRect().top - context.anchor.top);
       }

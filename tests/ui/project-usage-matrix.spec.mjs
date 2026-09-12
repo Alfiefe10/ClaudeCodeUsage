@@ -100,6 +100,51 @@ test('a live dashboard patch preserves the active project range, view, and keybo
   });
 });
 
+test('a live Codex patch preserves project-matrix selection, focus, document identity, and horizontal scroll', async ({ page }) => {
+  await openCodex(page, { width: 560, height: 800 });
+  await openProjects(page);
+
+  const matrix = page.locator('#projects [data-project-matrix="codex"]');
+  const scroller = matrix.locator(
+    '[data-project-matrix-range-panel="30"] [data-project-matrix-heatmap] .project-matrix-scroll',
+  );
+  await expect(matrix.locator('[data-project-matrix-range="30"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(matrix.locator('[data-project-matrix-view="heatmap"]')).toHaveAttribute('aria-pressed', 'true');
+
+  const before = await scroller.evaluate((element) => {
+    const maxScrollLeft = element.scrollWidth - element.clientWidth;
+    const setStateCalls = window.__ccuSetStateCalls;
+    for (let step = 1; step <= 8; step += 1) {
+      element.scrollLeft = Math.min(maxScrollLeft, step * 35);
+      element.dispatchEvent(new Event('scroll'));
+    }
+    element.focus();
+    document.body.dataset.livePatchIdentity = 'preserved';
+    return {
+      scrollLeft: element.scrollLeft,
+      maxScrollLeft,
+      setStateCalls,
+      setStateCallsAfterGesture: window.__ccuSetStateCalls,
+    };
+  });
+  expect(before.maxScrollLeft).toBeGreaterThan(0);
+  expect(before.scrollLeft).toBeGreaterThan(0);
+  expect(before.setStateCallsAfterGesture).toBe(before.setStateCalls);
+  await expect(scroller).toBeFocused();
+
+  await patchCurrentDashboard(page, 'codex');
+
+  const restoredMatrix = page.locator('#projects [data-project-matrix="codex"]');
+  const restoredScroller = restoredMatrix.locator(
+    '[data-project-matrix-range-panel="30"] [data-project-matrix-heatmap] .project-matrix-scroll',
+  );
+  await expect(restoredMatrix.locator('[data-project-matrix-range="30"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(restoredMatrix.locator('[data-project-matrix-view="heatmap"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(restoredScroller).toBeFocused();
+  await expect(page.locator('body')).toHaveAttribute('data-live-patch-identity', 'preserved');
+  await expect.poll(() => restoredScroller.evaluate((element) => element.scrollLeft)).toBe(before.scrollLeft);
+});
+
 test('Project matrix stays inside a local scroller on a narrow page', async ({ page }) => {
   await openClaude(page, { width: 360, height: 800 });
   await openProjects(page);

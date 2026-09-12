@@ -383,6 +383,59 @@ test('a ready dashboard receives a live data fragment and reloads only when deli
   }
 });
 
+test('an unchanged Compare refresh does not assign a new Webview document', () => {
+  const originalLoad = (Module as any)._load;
+  const originalNow = Date.now;
+  (Module as any)._load = function(request: string, parent: unknown, isMain: boolean) {
+    if (request === 'vscode') {
+      return { workspace: { workspaceFolders: [] } };
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  try {
+    let now = CODEX_WEBVIEW_NOW;
+    Date.now = () => now;
+    const { UsageWebviewProvider } = require('../webview') as typeof import('../webview');
+    const provider = new UsageWebviewProvider({} as any) as any;
+    const usage = claudeUsageFixture();
+    const documentAssignments: string[] = [];
+    provider.currentProvider = 'compare';
+    provider.currentTab = 'today';
+    provider.todayData = usage;
+    provider.rolling30DayData = usage;
+    provider.allTimeData = usage;
+    provider.providerAvailability = { claude: true, codex: true, codexData: true };
+    provider.panel = {
+      webview: {
+        set html(value: string) {
+          documentAssignments.push(value);
+        },
+      },
+    };
+
+    provider.updateWebview();
+    assert.equal(documentAssignments.length, 1, 'the initial Compare paint assigns one document');
+
+    now += 60_000;
+    provider.updateData(null, usage, usage, usage);
+    assert.equal(
+      documentAssignments.length,
+      1,
+      'an unchanged provider snapshot remains byte-identical as wall-clock time advances',
+    );
+
+    now += 60_000;
+    provider.updateData(null, usage, usage, {
+      ...usage,
+      totalInputTokens: usage.totalInputTokens + 1,
+    });
+    assert.equal(documentAssignments.length, 2, 'changed Compare data still assigns a fresh document');
+  } finally {
+    Date.now = originalNow;
+    (Module as any)._load = originalLoad;
+  }
+});
+
 test('webview provider changes are allowlisted and kept outside time tabs', () => {
   const source = readFileSync(
     path.resolve(__dirname, '..', '..', 'src', 'webview.ts'),

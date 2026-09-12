@@ -925,6 +925,8 @@ export class UsageWebviewProvider {
   private scheduledDashboardLivePatch: PendingDashboardLivePatch | undefined;
   private dashboardLivePatchSendScheduled = false;
   private lastLivePatchStructureKey: string | undefined;
+  private compareSnapshotRenderKey: string | undefined;
+  private compareSnapshotUpdatedAt = 0;
   private currentSessionData: SessionData | null = null;
   private todayData: UsageData | null = null;
   private rolling30DayData: UsageData | null = null;
@@ -3021,7 +3023,6 @@ export class UsageWebviewProvider {
 
   private renderCodexCompare(): string {
     const claude = this.allTimeData;
-    const updatedAt = Date.now();
     const formatters = createCodexLocalizedFormatters(
       I18n.getLocale(),
       I18n.getTimezone(),
@@ -3050,11 +3051,7 @@ export class UsageWebviewProvider {
     const sharingWorkspace = this.setting<boolean>('enableShareCard', true)
       ? this.renderCombinedHeatmapPanel()
       : '';
-    return sharingWorkspace +
-      '<section class="usage-summary">' +
-      '<p class="model-details"><strong>' + this.escapeHtml(copy.indexedAllTime) + '</strong> · ' +
-      this.escapeHtml(copy.updatedAt) + ': ' + this.escapeHtml(formatters.formatDateTime(updatedAt)) + '</p>' +
-      '<div class="summary-grid">' +
+    const summaryGrid = '<div class="summary-grid">' +
       card(
         I18n.t.providers.claude,
         copy.claudeTokenAccounting,
@@ -3069,9 +3066,22 @@ export class UsageWebviewProvider {
         codexTotals.cache,
         codexTotals.output,
       ) +
-      '</div></section>' +
-      this.renderWeeklyValuePanel('claude') +
+      '</div>';
+    const weeklyPanels = this.renderWeeklyValuePanel('claude') +
       this.renderWeeklyValuePanel('codex');
+    const renderKey = createHash('sha256')
+      .update(sharingWorkspace + summaryGrid + weeklyPanels, 'utf8')
+      .digest('hex');
+    if (renderKey !== this.compareSnapshotRenderKey) {
+      this.compareSnapshotRenderKey = renderKey;
+      this.compareSnapshotUpdatedAt = Date.now();
+    }
+    return sharingWorkspace +
+      '<section class="usage-summary">' +
+      '<p class="model-details"><strong>' + this.escapeHtml(copy.indexedAllTime) + '</strong> · ' +
+      this.escapeHtml(copy.updatedAt) + ': ' +
+      this.escapeHtml(formatters.formatDateTime(this.compareSnapshotUpdatedAt)) + '</p>' +
+      summaryGrid + '</section>' + weeklyPanels;
   }
 
   private getAlternateProviderContent(): string {

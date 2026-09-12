@@ -18,6 +18,14 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
   replaced by a rebuild.
   Release Drafter also performs a merge-complete reconciliation pass so the PR
   that triggered the main-branch push cannot be omitted by event-ordering races.
+- **Smoother live Webview refreshes** — provider-panel patches now preserve
+  bounded chart, table, project-matrix, heatmap, sharing, preview, and tab-strip
+  horizontal positions with transient privacy-safe structural keys, alongside
+  the existing document identity, focus, selection, and vertical anchor. Local
+  scrolling still performs no per-frame Extension Host persistence.
+- **Stable unchanged Compare refreshes** — the displayed update time now follows
+  the stable rendered data snapshot. An unchanged Compare refresh remains
+  byte-identical and no longer forces a complete Webview document replacement.
 
 ## [2.3.2] — 2026-09-12
 

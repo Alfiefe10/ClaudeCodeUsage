@@ -102,6 +102,12 @@ Codex 的「今天」指配置时区中的当前自然日，而不是最近任�
 仍独立展示。未知模型计入 Token 分母但保持未定价，因此定价 coverage 始终可见。Claude 与 Codex 的
 时间序列布局使用对齐的响应式宽度，较密集的图表和表格在各自可键盘聚焦的区域内滚动。
 
+Provider panel 的实时 patch 会保留页面 anchor，以及标签栏、图表、表格、项目矩阵、
+热力图、分享区和预览区等有界 scroller 的非零水平位置。匹配只使用本次 patch 期间
+驻留内存的 privacy-safe 结构 key；不会逐帧写入 Webview state，也不会发送给
+Extension Host。Compare 显示的更新时间绑定到稳定的已渲染数据 snapshot，因此
+数据未变化的 refresh 保持 byte-identical，不会替换整份文档。
+
 ## Token 与 limit 语义
 
 Claude record 带 Anthropic 的四个 token bucket。扩展对其校验、去重、求和并按模型计价。

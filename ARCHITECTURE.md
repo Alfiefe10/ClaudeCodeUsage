@@ -122,6 +122,14 @@ the token denominator but remain unpriced, so pricing coverage stays visible.
 Claude and Codex time-series layouts share aligned responsive widths and keep
 dense chart/table content inside local keyboard-focusable scrollers.
 
+Provider-panel live patches preserve the page anchor plus non-zero horizontal
+positions for the dashboard tab strip and bounded chart, table, project-matrix,
+heatmap, sharing, and preview scrollers. Those positions are matched with
+privacy-safe structural keys held only for the in-flight patch; they are not
+written per frame to Webview state or sent to the Extension Host. Compare's
+displayed update time is tied to its stable rendered data snapshot, so an
+unchanged refresh remains byte-identical and does not replace the document.
+
 ## Token and limit semantics
 
 Claude records carry Anthropic's four token buckets. The extension validates,
