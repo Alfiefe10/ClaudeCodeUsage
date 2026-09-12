@@ -446,6 +446,9 @@ test('a live dashboard patch cannot restore a snapshot the host invalidated', as
     statusText: '',
   });
 
+  await page.locator(
+    '[data-advice-provider="claude"] [data-advice-consent-kind="aggregate"]',
+  ).focus();
   await dispatchDashboardDataPatch(page, 'claude');
 
   await expect(page.locator(

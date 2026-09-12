@@ -358,6 +358,9 @@ function ccuCaptureRefreshAnchor(panel, focusedDescriptor) {
 
 function ccuCaptureTransientControl(element, panel) {
   if (!element || !element.matches || !element.matches('input,select,textarea')) { return null; }
+  // Consent is durable host-owned state. Preserving a focused checkbox value
+  // across a patch could visually revive permission that the host just revoked.
+  if (element.matches('[data-advice-consent-kind]')) { return null; }
   var descriptor = ccuRefreshDescriptor(element, panel, true);
   if (!descriptor) { return null; }
   var state = { descriptor: descriptor, value: element.value };
