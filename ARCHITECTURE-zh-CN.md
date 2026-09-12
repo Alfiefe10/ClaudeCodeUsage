@@ -221,14 +221,26 @@ process-local 的已物化 accumulator，其 cutoff 与 `ClaudeDataLoader` 一�
 整文件过期时同样只用元数据 rebase。cutoff 跨过 frontier 时，只重读受影响的边界文件，以及
 first-owner 可能变化的 UUID claimant。
 
+已完整落盘但格式错误的 JSONL 行是稳定的忽略项，不会使 cutoff 元数据失效，也不会造成反复正文
+读取。尚未完整的 JSON fragment 留在安全 cursor 之后等待续写；若 EOF 处已经是语法有效的 JSON，
+即使没有末尾换行也会被接纳，后续 append 则必须先证明原 record 边界仍成立。内容分析关闭期间可以
+在内存中按新时区重分普通用量；再次开启时，所有依赖日期的分析 contribution 必须先重建再发布，
+因此跨 DST 切换也不会沿用旧时区的 day key。
+
 普通的单文件 append 会先只读已验证 tail、应用变化文件 delta，并只重校准受影响的 canonical
-response identity。重复 UUID 查询最多经过 64 个 immutable layer；偶发的 O(U) 压实替代每次
-append 都重建完整 UUID set。若 tail 中出现的 UUID 也存在于排序更后的文件，global first-owner
-可能改变，因此丢弃 provisional tail 结果，并按 full loader 的完整文件顺序重建分析。新建/替换
-文件、多文件 append、move、delete、cutoff 向后移动，以及原本无时间戳的文件在 append 后首次
-获得时间戳，也走同一 correctness-first 有序重建。这是主动收缩优化范围，避免 fast path 与 full
-loader 产生语义差异。每文件 skill candidate 同时保留匹配 preamble 的事件计数，最终有序物化时
-才应用全局 5,000 次上限。
+response identity。仅含数字的结构摘要按全局文件顺序保留 legacy accumulator 的
+`tool_use` → `tool_result` 映射和 Skill preamble 归因；warm append 只重放被触及的 tool ID。
+UUID membership 最多查询 64 个 immutable layer，并通过 direct first-owner map 判断本次 UUID
+是否可继续走增量路径，无需搜索排序更后的每个文件；偶发的 O(U) 压实替代每次 append 都重建完整
+UUID set。若 tail 抢占了更后文件的 UUID owner，则丢弃 provisional 结果，并按 full loader 的
+完整文件顺序重建分析。
+
+该 canonical 顺序直接保留 bounded timestamp probe 的结果：若文件开头超过 1 MiB 的完整行均无
+时间戳，即使 full parse 随后遇到时间戳，该文件仍使用 loader 的 neutral timestamp 与 discovery
+rank。时间戳相同的文件若 `discoveryIndex` 相对顺序改变，也属于语义 reorder。新建/替换文件、
+多文件 append、move、delete、cutoff 向后移动，以及普通无时间戳文件 append 后首次出现 probe
+可见时间戳，都走同一 correctness-first 有序重建。每文件 Skill candidate 保留匹配 result 的数字
+证据；全局 5,000 次上限及早期文件造成的 boundary displacement 只在有序物化时应用。
 
 慢物化路径的内存复杂度为 O(F + A + R)（文件、保留的分析状态和校准 record）。仅 cutoff 变化时
 只读取边界/claimant 文件；source order 变化时可能重读完整语料，以重新建立 first-owner、prompt

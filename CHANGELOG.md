@@ -43,13 +43,14 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
   Anonymous refresh diagnostics count unnamed quota-watcher events, and Codex
   index diagnostics now identify their trigger, watcher/debounce counts, and
   actual backfill/worker mode without paths, filenames, or account data.
-- **Bounded Claude content-analysis refreshes** — safe single-file appends update
-  materialized analysis and calibration from the changed tail and affected
-  response identities. The rolling cutoff remains exactly aligned with the full
-  loader throughout the day; timestamp frontiers age out completed files without
-  body reads. UUID ownership/order changes and global skill-cap changes use a
-  correctness-first ordered rebuild instead of publishing a divergent fast-path
-  result.
+- **Exact bounded Claude content analysis** — the incremental index now preserves
+  the legacy full scan's global tool/Skill attribution, canonical timestamp and
+  discovery ordering, 5,000-Skill boundary, response calibration, and valid
+  JSON-at-EOF behavior. Safe appends replay only touched structural IDs and use
+  direct UUID-owner lookups; unchanged refreshes read zero bodies even when a
+  completed malformed line is present. Re-enabling analysis after a disabled
+  timezone change rebuilds day-sensitive contributions before publication,
+  including across DST boundaries.
 
 ## [2.3.2] — 2026-09-12
 

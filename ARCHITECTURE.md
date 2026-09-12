@@ -286,18 +286,37 @@ changes no result and needs no body read, while whole retained or expired files
 can be rebased from metadata. Crossing a frontier reparses the affected boundary
 and any UUID claimant whose first-owner status may change.
 
+Completed malformed JSONL lines are stable ignored input and therefore do not
+invalidate cutoff metadata or cause repeated body reads. An incomplete JSON
+fragment remains behind the safe cursor, while a syntactically valid JSON value
+at EOF is accepted even without a final newline; a later append must first
+preserve that record boundary. If content analysis is disabled, a timezone
+change may rebucket ordinary usage in memory, but re-enabling analysis rebuilds
+all day-sensitive analysis contributions before any result is published. This
+also covers DST transitions rather than copying stale day keys from the former
+zone.
+
 An ordinary single-file append first reads only the verified tail, applies the
 changed-file delta, and recalibrates only affected canonical response identities.
-Duplicate UUID lookups use at most 64 immutable layers; an occasional O(U)
-compaction replaces rebuilding the full UUID set on every append. If the tail
-contains a UUID also present in a later file, global first-owner order may change,
-so the provisional tail result is discarded and analysis is rebuilt in the
-loader's complete file order. New/replaced files, multi-file appends, moves,
-deletes, backward cutoff movement, and an append that gives an undated file its
-first timestamp use the same correctness-first ordered rebuild. This deliberately
-narrows the optimization instead of retaining a fast path that can disagree with
-the full loader. Per-file skill candidates retain matching preamble-event counts;
-the global 5,000-use cap is applied only during ordered materialization.
+Numeric-only structural summaries preserve the legacy accumulator's global
+`tool_use` → `tool_result` map and Skill-preamble attribution across file
+boundaries; warm appends replay only touched tool IDs. Duplicate UUID membership
+uses at most 64 immutable layers, and a direct first-owner map decides whether a
+touched UUID can stay incremental without searching every later file. An
+occasional O(U) compaction replaces rebuilding the full UUID set on every append.
+If a tail preempts a later UUID owner, the provisional result is discarded and
+analysis is rebuilt in the loader's complete file order.
+
+That canonical order retains the bounded timestamp probe itself: a file with
+more than 1 MiB of completed timestamp-less prefix keeps the loader's neutral
+timestamp and discovery rank even if full parsing later encounters a timestamp.
+A relative `discoveryIndex` change among timestamp ties is likewise treated as a
+semantic reorder. New/replaced files, multi-file appends, moves, deletes,
+backward cutoff movement, and an append that gives an ordinarily undated file
+its first probe-visible timestamp use the same correctness-first ordered rebuild.
+Per-file Skill candidates retain numeric matching-result evidence; the global
+5,000-use cap and any earlier-file displacement are applied only during ordered
+materialization.
 
 The slow materialization path is O(F + A + R) in memory (files, retained analysis
 state, and calibration records). Cutoff-only work reads boundary/claimant files;
