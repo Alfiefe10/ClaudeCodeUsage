@@ -103,6 +103,28 @@ export interface AnalysisBucket {
   count: number;
 }
 
+/** Numeric-only structural summaries retained by the incremental Claude index.
+ * They are sufficient to replay the legacy accumulator's cross-file tool
+ * mappings without keeping tool-result bodies or tool arguments. */
+export type AnalysisStructuralEvent =
+  | {
+      kind: 'tool-use';
+      toolId: string;
+      toolName: string;
+      skillUse?: SkillUse;
+    }
+  | {
+      kind: 'tool-result';
+      toolId: string;
+      tokens: number;
+      chars: number;
+      count: number;
+    }
+  | {
+      kind: 'command';
+      skillUse: SkillUse;
+    };
+
 export interface AnalysisAcc {
   cat: Record<string, AnalysisBucket>;
   tools: Record<string, AnalysisBucket>;
@@ -127,10 +149,13 @@ export interface AnalysisAcc {
   observedInputEstimatedTokens: number;
   userAuthoredEstimatedTokens: number;
   toolResultEstimatedTokens: number;
+  /** Present only for per-file incremental contributions. The legacy full
+   * loader does not pay this retention cost. */
+  structuralEvents?: AnalysisStructuralEvent[];
 }
 
 // cutoffMs: ignore log lines older than this (0 = no cutoff).
-export function newAnalysisAcc(cutoffMs: number): AnalysisAcc {
+export function newAnalysisAcc(cutoffMs: number, captureStructuralEvents = false): AnalysisAcc {
   return {
     cat: {},
     tools: {},
@@ -147,6 +172,7 @@ export function newAnalysisAcc(cutoffMs: number): AnalysisAcc {
     observedInputEstimatedTokens: 0,
     userAuthoredEstimatedTokens: 0,
     toolResultEstimatedTokens: 0,
+    ...(captureStructuralEvents ? { structuralEvents: [] } : {}),
   };
 }
 
@@ -213,14 +239,16 @@ function collectCommandUse(acc: AnalysisAcc, text: string, sessionId: string, ti
     return;
   }
   const ts = typeof timestamp === 'string' ? Date.parse(timestamp) : NaN;
-  acc.skillUses.push({
+  const use: SkillUse = {
     name,
     sessionId,
     day: localDayKey(timestamp),
     ts: isNaN(ts) ? 0 : ts,
     estTokens: estimateTokens(text),
-  });
+  };
+  acc.skillUses.push(use);
   acc.skillPreambleCounts.push(0);
+  acc.structuralEvents?.push({ kind: 'command', skillUse: { ...use } });
 }
 
 // Rough token estimate from text length (CJK characters are denser than ASCII).
@@ -387,6 +415,7 @@ export function analyzeLine(parsed: any, acc: AnalysisAcc, isSubagentFile = fals
             hiddenThinking = true;
           }
         } else if (block.type === 'tool_use') {
+          let structuralSkillUse: SkillUse | undefined;
           if (typeof block.id === 'string' && typeof block.name === 'string') {
             acc.toolIdToName[block.id] = block.name;
             // Skill invocations: remember the tool_use_id so the matching
@@ -395,15 +424,22 @@ export function analyzeLine(parsed: any, acc: AnalysisAcc, isSubagentFile = fals
             if (block.name === 'Skill' && typeof skillName === 'string' && acc.skillUses.length < MAX_SKILL_USES) {
               acc.skillByToolId[block.id] = acc.skillUses.length;
               const skillTs = typeof parsed.timestamp === 'string' ? Date.parse(parsed.timestamp) : NaN;
-              acc.skillUses.push({
+              structuralSkillUse = {
                 name: skillName,
                 sessionId,
                 day: localDayKey(parsed.timestamp),
                 ts: isNaN(skillTs) ? 0 : skillTs,
                 estTokens: 0,
-              });
+              };
+              acc.skillUses.push(structuralSkillUse);
               acc.skillPreambleCounts.push(0);
             }
+            acc.structuralEvents?.push({
+              kind: 'tool-use',
+              toolId: block.id,
+              toolName: block.name,
+              ...(structuralSkillUse ? { skillUse: { ...structuralSkillUse } } : {}),
+            });
           }
           const inputJson = JSON.stringify(block.input || {});
           addToBucket(acc.cat, 'toolCalls', inputJson);
@@ -437,6 +473,13 @@ export function analyzeLine(parsed: any, acc: AnalysisAcc, isSubagentFile = fals
         if (block.type === 'tool_result') {
           const text = blockText(block.content);
           const toolResultTokens = estimateTokens(text);
+          acc.structuralEvents?.push({
+            kind: 'tool-result',
+            toolId: String(block.tool_use_id),
+            tokens: toolResultTokens,
+            chars: text.length,
+            count: text ? 1 : 0,
+          });
           acc.toolResultEstimatedTokens += toolResultTokens;
           acc.observedInputEstimatedTokens += toolResultTokens + 8;
           addToBucket(acc.cat, 'toolResults', text);

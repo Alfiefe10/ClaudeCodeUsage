@@ -9,6 +9,8 @@ import {
 } from './claudeUsageFiles';
 import {
   AnalysisAcc,
+  AnalysisBucket,
+  AnalysisStructuralEvent,
   analyzeLine,
   ClaudeDataLoader,
   finalizeAnalysis,
@@ -66,8 +68,23 @@ interface TaggedAnalysisPrompt {
 interface TaggedAnalysisSkillUse {
   fileId: string;
   position: number;
+  baseValue: AnalysisSkillUse;
   value: AnalysisSkillUse;
   preambleCount: number;
+  toolId?: string;
+}
+
+type AnalysisToolEvent = Exclude<AnalysisStructuralEvent, { kind: 'command' }>;
+
+interface TaggedAnalysisToolEvent {
+  fileId: string;
+  position: number;
+  value: AnalysisToolEvent;
+}
+
+interface ResolvedToolBucket {
+  bucket: AnalysisBucket;
+  firstEvent: TaggedAnalysisToolEvent;
 }
 
 interface AnalysisCalibration {
@@ -84,12 +101,17 @@ interface AnalysisRuntimeState {
   asOfDay: string;
   cutoffMs: number;
   orderedFileIds: string[];
+  filePositionById: ReadonlyMap<string, number>;
   merged: AnalysisAcc;
   promptTail: TaggedAnalysisPrompt[];
   skillHead: TaggedAnalysisSkillUse[];
   calibration: AnalysisCalibration;
   calibrationOldestTimestampMs?: number;
   uuidLayers: ReadonlySet<string>[];
+  firstUuidFileByUuid: ReadonlyMap<string, string>;
+  toolEventsById: ReadonlyMap<string, readonly TaggedAnalysisToolEvent[]>;
+  toolBucketsById: ReadonlyMap<string, ReadonlyMap<string, ResolvedToolBucket>>;
+  firstToolResultByName: ReadonlyMap<string, TaggedAnalysisToolEvent>;
 }
 
 const analysisRuntimeByIndex = new WeakMap<ClaudeUsageIndex, AnalysisRuntimeState>();
@@ -297,6 +319,7 @@ function sameAnalysisPayload(
 interface ParsedPlan extends FilePlan {
   contribution: ClaudeUsageFileContribution;
   analysisTouchedUuids: Set<string>;
+  analysisTouchedToolIds: Set<string>;
   bytesRead: number;
   linesParsed: number;
 }
@@ -518,6 +541,18 @@ function cloneAnalysisAcc(value: AnalysisAcc): AnalysisAcc {
     observedInputEstimatedTokens: value.observedInputEstimatedTokens,
     userAuthoredEstimatedTokens: value.userAuthoredEstimatedTokens,
     toolResultEstimatedTokens: value.toolResultEstimatedTokens,
+    ...(value.structuralEvents
+      ? {
+          structuralEvents: value.structuralEvents.map((event) => event.kind === 'tool-use'
+            ? {
+                ...event,
+                ...(event.skillUse ? { skillUse: { ...event.skillUse } } : {}),
+              }
+            : event.kind === 'command'
+              ? { ...event, skillUse: { ...event.skillUse } }
+              : { ...event }),
+        }
+      : {}),
   };
 }
 
@@ -551,7 +586,132 @@ function analysisFilesInOrder(index: ClaudeUsageIndex): ClaudeUsageFileContribut
 }
 
 function mergeAnalysisWithoutUuids(target: AnalysisAcc, source: AnalysisAcc): void {
-  mergeAnalysisAcc(target, { ...source, seenUuids: new Set<string>() });
+  const frameworkOverhead = { ...source.frameworkOverhead };
+  delete frameworkOverhead['skill-preamble'];
+  mergeAnalysisAcc(target, {
+    ...source,
+    tools: {},
+    seenUuids: new Set<string>(),
+    skillUses: [],
+    skillPreambleCounts: [],
+    frameworkOverhead,
+  });
+}
+
+function taggedOrder(
+  orderedFileIds: readonly string[],
+): (left: { fileId: string; position: number }, right: { fileId: string; position: number }) => number {
+  const order = new Map(orderedFileIds.map((fileId, index) => [fileId, index]));
+  return (left, right) =>
+    (order.get(left.fileId) ?? Number.MAX_SAFE_INTEGER) -
+      (order.get(right.fileId) ?? Number.MAX_SAFE_INTEGER) ||
+    left.position - right.position;
+}
+
+function skillKey(value: Pick<TaggedAnalysisSkillUse, 'fileId' | 'position'>): string {
+  return `${value.fileId}\0${value.position}`;
+}
+
+function skillCandidates(
+  fileId: string,
+  analysis: AnalysisAcc,
+): TaggedAnalysisSkillUse[] {
+  const candidates: TaggedAnalysisSkillUse[] = [];
+  for (const [position, event] of (analysis.structuralEvents ?? []).entries()) {
+    const baseValue = event.kind === 'command'
+      ? event.skillUse
+      : event.kind === 'tool-use'
+        ? event.skillUse
+        : undefined;
+    if (!baseValue) continue;
+    candidates.push({
+      fileId,
+      position,
+      baseValue: { ...baseValue },
+      value: { ...baseValue },
+      preambleCount: 0,
+      ...(event.kind === 'tool-use' ? { toolId: event.toolId } : {}),
+    });
+  }
+  return candidates;
+}
+
+function resolveToolBuckets(
+  events: readonly TaggedAnalysisToolEvent[],
+): Map<string, ResolvedToolBucket> {
+  const resolved = new Map<string, ResolvedToolBucket>();
+  let toolName = 'unknown';
+  for (const event of events) {
+    if (event.value.kind === 'tool-use') {
+      toolName = event.value.toolName;
+      continue;
+    }
+    if (event.value.count === 0) continue;
+    const current = resolved.get(toolName) ?? {
+      bucket: { tokens: 0, chars: 0, count: 0 },
+      firstEvent: event,
+    };
+    current.bucket.tokens += event.value.tokens;
+    current.bucket.chars += event.value.chars;
+    current.bucket.count += event.value.count;
+    resolved.set(toolName, current);
+  }
+  return resolved;
+}
+
+function materializeToolBuckets(
+  target: AnalysisAcc,
+  bucketsById: ReadonlyMap<string, ReadonlyMap<string, ResolvedToolBucket>>,
+  orderedFileIds: readonly string[],
+): Map<string, TaggedAnalysisToolEvent> {
+  const totals = new Map<string, AnalysisBucket>();
+  const firstByName = new Map<string, TaggedAnalysisToolEvent>();
+  const compare = taggedOrder(orderedFileIds);
+  for (const buckets of bucketsById.values()) {
+    for (const [name, resolved] of buckets) {
+      const total = totals.get(name) ?? { tokens: 0, chars: 0, count: 0 };
+      total.tokens += resolved.bucket.tokens;
+      total.chars += resolved.bucket.chars;
+      total.count += resolved.bucket.count;
+      totals.set(name, total);
+      const first = firstByName.get(name);
+      if (!first || compare(resolved.firstEvent, first) < 0) {
+        firstByName.set(name, resolved.firstEvent);
+      }
+    }
+  }
+  target.tools = {};
+  for (const [name, bucket] of [...totals].sort((left, right) =>
+    compare(firstByName.get(left[0])!, firstByName.get(right[0])!))) {
+    target.tools[name] = bucket;
+  }
+  return firstByName;
+}
+
+function resolveSkillPreambles(
+  skillHead: TaggedAnalysisSkillUse[],
+  eventsById: ReadonlyMap<string, readonly TaggedAnalysisToolEvent[]>,
+  onlyToolIds?: ReadonlySet<string>,
+): void {
+  const selected = new Map(skillHead.map((entry) => [skillKey(entry), entry]));
+  for (const entry of skillHead) {
+    if (!entry.toolId || (onlyToolIds && !onlyToolIds.has(entry.toolId))) continue;
+    entry.value = { ...entry.baseValue };
+    entry.preambleCount = 0;
+  }
+  for (const [toolId, events] of eventsById) {
+    if (onlyToolIds && !onlyToolIds.has(toolId)) continue;
+    let active: TaggedAnalysisSkillUse | undefined;
+    for (const event of events) {
+      if (event.value.kind === 'tool-use') {
+        const candidate = selected.get(`${event.fileId}\0${event.position}`);
+        if (candidate) active = candidate;
+      } else if (active) {
+        active.value.estTokens += event.value.tokens;
+        active.preambleCount += 1;
+      }
+    }
+  }
 }
 
 function calibrationContribution(
@@ -621,6 +781,10 @@ function buildAnalysisRuntimeState(
   const skillHead: TaggedAnalysisSkillUse[] = [];
   const seenUuids = new Set<string>();
   const orderedFiles = analysisFilesInOrder(index);
+  const orderedFileIds = orderedFiles.map((file) => file.fileId);
+  const filePositionById = new Map(orderedFileIds.map((fileId, position) => [fileId, position]));
+  const firstUuidFileByUuid = new Map<string, string>();
+  const toolEventsById = new Map<string, TaggedAnalysisToolEvent[]>();
   for (const file of orderedFiles) {
     if (!file.analysis) continue;
     mergeAnalysisWithoutUuids(merged, file.analysis);
@@ -628,19 +792,32 @@ function buildAnalysisRuntimeState(
       promptTail.push({ fileId: file.fileId, position, value: { ...value } });
       if (promptTail.length > ANALYSIS_PROMPT_ACC_LIMIT) promptTail.shift();
     }
+    for (const uuid of file.analysis.seenUuids) {
+      if (!firstUuidFileByUuid.has(uuid)) firstUuidFileByUuid.set(uuid, file.fileId);
+    }
+    for (const [position, event] of (file.analysis.structuralEvents ?? []).entries()) {
+      if (event.kind === 'command') continue;
+      const tagged: TaggedAnalysisToolEvent = { fileId: file.fileId, position, value: event };
+      const events = toolEventsById.get(event.toolId) ?? [];
+      events.push(tagged);
+      toolEventsById.set(event.toolId, events);
+    }
     if (skillHead.length < ANALYSIS_SKILL_USE_LIMIT) {
-      for (const [position, value] of file.analysis.skillUses.entries()) {
-        if (skillHead.length >= ANALYSIS_SKILL_USE_LIMIT) break;
-        skillHead.push({
-          fileId: file.fileId,
-          position,
-          value: { ...value },
-          preambleCount: file.analysis.skillPreambleCounts[position] ?? 0,
-        });
-      }
+      skillHead.push(...skillCandidates(file.fileId, file.analysis)
+        .slice(0, ANALYSIS_SKILL_USE_LIMIT - skillHead.length));
     }
     for (const uuid of file.analysis.seenUuids) seenUuids.add(uuid);
   }
+  const toolBucketsById = new Map<string, ReadonlyMap<string, ResolvedToolBucket>>();
+  for (const [toolId, events] of toolEventsById) {
+    toolBucketsById.set(toolId, resolveToolBuckets(events));
+  }
+  const firstToolResultByName = materializeToolBuckets(
+    merged,
+    toolBucketsById,
+    orderedFileIds,
+  );
+  resolveSkillPreambles(skillHead, toolEventsById);
   merged.seenUuids = new Set<string>();
   merged.prompts = promptTail.map((entry) => ({ ...entry.value }));
   applySkillHead(merged, skillHead);
@@ -648,13 +825,18 @@ function buildAnalysisRuntimeState(
   return {
     asOfDay,
     cutoffMs,
-    orderedFileIds: orderedFiles.map((file) => file.fileId),
+    orderedFileIds,
+    filePositionById,
     merged,
     promptTail,
     skillHead,
     calibration: calibrationState.calibration,
     calibrationOldestTimestampMs: calibrationState.oldestTimestampMs,
     uuidLayers: [seenUuids],
+    firstUuidFileByUuid,
+    toolEventsById,
+    toolBucketsById,
+    firstToolResultByName,
   };
 }
 
@@ -731,7 +913,6 @@ function addAppendAnalysisDelta(
   after: AnalysisAcc,
 ): void {
   addBucketDelta(target.cat, before.cat, after.cat);
-  addBucketDelta(target.tools, before.tools, after.tools);
   addThinkingDelta(target.thinkingBySession, before.thinkingBySession, after.thinkingBySession);
   addThinkingDelta(target.thinkingByDay, before.thinkingByDay, after.thinkingByDay);
   addFrameworkDelta(target.frameworkOverhead, before.frameworkOverhead, after.frameworkOverhead);
@@ -766,24 +947,93 @@ function refreshedSkillHead(
   state: AnalysisRuntimeState,
   appended: ReadonlyMap<string, AnalysisAcc>,
 ): TaggedAnalysisSkillUse[] {
-  const order = new Map(state.orderedFileIds.map((fileId, index) => [fileId, index]));
-  const candidates = state.skillHead.filter((entry) => !appended.has(entry.fileId));
+  const compare = taggedOrder(state.orderedFileIds);
+  const candidates = state.skillHead
+    .filter((entry) => !appended.has(entry.fileId))
+    .map((entry) => ({
+      ...entry,
+      baseValue: { ...entry.baseValue },
+      value: { ...entry.value },
+    }));
   for (const [fileId, analysis] of appended) {
-    for (const [position, value] of analysis.skillUses.entries()) {
-      candidates.push({
-        fileId,
-        position,
-        value: { ...value },
-        preambleCount: analysis.skillPreambleCounts[position] ?? 0,
-      });
+    candidates.push(...skillCandidates(fileId, analysis));
+  }
+  candidates.sort(compare);
+  return candidates.slice(0, ANALYSIS_SKILL_USE_LIMIT);
+}
+
+function refreshedStructuralRuntime(
+  state: AnalysisRuntimeState,
+  merged: AnalysisAcc,
+  appended: ReadonlyMap<string, AnalysisAcc>,
+  touchedToolIds: ReadonlySet<string>,
+): Pick<
+  AnalysisRuntimeState,
+  'skillHead' | 'toolEventsById' | 'toolBucketsById' | 'firstToolResultByName'
+> {
+  const changedFileIds = new Set(appended.keys());
+  const compare = taggedOrder(state.orderedFileIds);
+  const toolEventsById = new Map(state.toolEventsById);
+  const toolBucketsById = new Map(state.toolBucketsById);
+  for (const toolId of touchedToolIds) {
+    const events = (state.toolEventsById.get(toolId) ?? [])
+      .filter((event) => !changedFileIds.has(event.fileId))
+      .map((event) => ({ ...event, value: { ...event.value } } as TaggedAnalysisToolEvent));
+    for (const [fileId, analysis] of appended) {
+      for (const [position, event] of (analysis.structuralEvents ?? []).entries()) {
+        if (event.kind === 'command' || event.toolId !== toolId) continue;
+        events.push({ fileId, position, value: event });
+      }
+    }
+    events.sort(compare);
+    if (events.length > 0) {
+      toolEventsById.set(toolId, events);
+      toolBucketsById.set(toolId, resolveToolBuckets(events));
+    } else {
+      toolEventsById.delete(toolId);
+      toolBucketsById.delete(toolId);
     }
   }
-  candidates.sort((left, right) =>
-    (order.get(left.fileId) ?? Number.MAX_SAFE_INTEGER) -
-      (order.get(right.fileId) ?? Number.MAX_SAFE_INTEGER) ||
-    left.position - right.position,
+
+  const previousHeadByKey = new Map(state.skillHead.map((entry) => [skillKey(entry), entry]));
+  const skillHead = refreshedSkillHead(state, appended);
+  const affectedSkillToolIds = new Set(touchedToolIds);
+  const previousKeysByTool = new Map<string, string[]>();
+  const nextKeysByTool = new Map<string, string[]>();
+  for (const entry of state.skillHead) {
+    if (!entry.toolId) continue;
+    const keys = previousKeysByTool.get(entry.toolId) ?? [];
+    keys.push(skillKey(entry));
+    previousKeysByTool.set(entry.toolId, keys);
+  }
+  for (const entry of skillHead) {
+    if (!entry.toolId) continue;
+    const keys = nextKeysByTool.get(entry.toolId) ?? [];
+    keys.push(skillKey(entry));
+    nextKeysByTool.set(entry.toolId, keys);
+  }
+  for (const toolId of new Set([...previousKeysByTool.keys(), ...nextKeysByTool.keys()])) {
+    if ((previousKeysByTool.get(toolId) ?? []).join('\0') !==
+      (nextKeysByTool.get(toolId) ?? []).join('\0')) {
+      affectedSkillToolIds.add(toolId);
+    }
+  }
+  for (const entry of skillHead) {
+    if (!entry.toolId || affectedSkillToolIds.has(entry.toolId)) continue;
+    const previous = previousHeadByKey.get(skillKey(entry));
+    if (previous) {
+      entry.value = { ...previous.value };
+      entry.preambleCount = previous.preambleCount;
+    }
+  }
+  resolveSkillPreambles(skillHead, toolEventsById, affectedSkillToolIds);
+
+  const firstToolResultByName = materializeToolBuckets(
+    merged,
+    toolBucketsById,
+    state.orderedFileIds,
   );
-  return candidates.slice(0, ANALYSIS_SKILL_USE_LIMIT);
+  return { skillHead, toolEventsById, toolBucketsById, firstToolResultByName };
 }
 
 function appendCalibration(
@@ -852,7 +1102,7 @@ function rebaseFileAnalysisCutoff(
       ...prior,
       path: entry.path,
       fingerprint: entry,
-      analysis: newAnalysisAcc(cutoffMs),
+      analysis: newAnalysisAcc(cutoffMs, true),
       analysisOldestIncludedTimestampMs: undefined,
     };
   } else if (prior.analysisOldestIncludedTimestampMs !== undefined &&
@@ -890,7 +1140,7 @@ async function parsePlan(
         recentPrompts: new Map<string, number>(),
         usage: new Map<string, IndexedRecord>(),
         prompts: new Map<string, IndexedRecord>(),
-        analysis: analyzeContent ? newAnalysisAcc(analysisCutoffMs) : null,
+        analysis: analyzeContent ? newAnalysisAcc(analysisCutoffMs, true) : null,
         analysisAllUuids: new Set<string>(),
         analysisRangeComplete: analyzeContent,
         analysisOldestIncludedTimestampMs: undefined,
@@ -898,7 +1148,7 @@ async function parsePlan(
       };
   if (!analyzeContent) base.analysis = null;
   else if (!base.analysis || base.analysis.cutoffMs !== analysisCutoffMs) {
-    base.analysis = newAnalysisAcc(analysisCutoffMs);
+    base.analysis = newAnalysisAcc(analysisCutoffMs, true);
     base.analysisOldestIncludedTimestampMs = undefined;
   }
   const ownedAnalysisUuids = new Set(base.analysis?.seenUuids ?? []);
@@ -932,6 +1182,7 @@ async function parsePlan(
 
   let linesParsed = 0;
   const analysisTouchedUuids = new Set<string>();
+  const analysisTouchedToolIds = new Set<string>();
   const scan = await scanCodexJsonlLines(
     runtimeEntry(plan.entry, plan.fileId),
     defaultCodexJsonlReader,
@@ -963,9 +1214,13 @@ async function parsePlan(
           analysisTouchedUuids.add(parsed.uuid);
         }
         if (base.analysis) {
+          const structuralEventStart = base.analysis.structuralEvents?.length ?? 0;
           const uuid = typeof parsed.uuid === 'string' ? parsed.uuid : undefined;
           const alreadySeen = uuid ? base.analysis.seenUuids.has(uuid) : false;
           analyzeLine(parsed, base.analysis, isSubagentFile, sessionInfo.sessionId);
+          for (const event of base.analysis.structuralEvents?.slice(structuralEventStart) ?? []) {
+            if (event.kind !== 'command') analysisTouchedToolIds.add(event.toolId);
+          }
           const newlyOwnedUuid = Boolean(
             uuid && !alreadySeen && base.analysis.seenUuids.has(uuid),
           );
@@ -1101,6 +1356,7 @@ async function parsePlan(
     ...plan,
     contribution: base,
     analysisTouchedUuids,
+    analysisTouchedToolIds,
     bytesRead: scan.bytesRead,
     linesParsed,
   };
@@ -2273,22 +2529,18 @@ export async function updateClaudeUsageIndex(
     if (fastAppendAnalysis && previousAnalysisRuntime && parsedPlans.length === 1 &&
       parsedPlans[0].kind === 'append') {
       const appended = parsedPlans[0];
-      const filePosition = previousAnalysisRuntime.orderedFileIds.indexOf(appended.fileId);
+      const filePosition = previousAnalysisRuntime.filePositionById.get(appended.fileId) ?? -1;
       let laterOwnerCollision = filePosition < 0;
-      for (let index = filePosition + 1;
-        !laterOwnerCollision && index < previousAnalysisRuntime.orderedFileIds.length;
-        index += 1) {
-        const laterFile = previous.files.get(previousAnalysisRuntime.orderedFileIds[index]);
-        if (!laterFile) {
+      for (const uuid of appended.analysisTouchedUuids) {
+        if (laterOwnerCollision) break;
+        const ownerFileId = previousAnalysisRuntime.firstUuidFileByUuid.get(uuid);
+        if (!ownerFileId || ownerFileId === appended.fileId) continue;
+        const ownerPosition = previousAnalysisRuntime.filePositionById.get(ownerFileId);
+        if (ownerPosition === undefined) {
           laterOwnerCollision = true;
           break;
         }
-        for (const uuid of appended.analysisTouchedUuids) {
-          if (laterFile.analysisAllUuids.has(uuid)) {
-            laterOwnerCollision = true;
-            break;
-          }
-        }
+        laterOwnerCollision = ownerPosition > filePosition;
       }
       if (laterOwnerCollision) {
         forcedFullAnalysisRebuild = true;
@@ -2422,7 +2674,17 @@ export async function updateClaudeUsageIndex(
       appended.set(plan.fileId, plan.contribution.analysis);
     }
     const promptTail = refreshedPromptTail(previousAnalysisRuntime, appended);
-    const skillHead = refreshedSkillHead(previousAnalysisRuntime, appended);
+    const touchedToolIds = new Set<string>();
+    for (const plan of parsedPlans) {
+      for (const toolId of plan.analysisTouchedToolIds) touchedToolIds.add(toolId);
+    }
+    const structural = refreshedStructuralRuntime(
+      previousAnalysisRuntime,
+      merged,
+      appended,
+      touchedToolIds,
+    );
+    const skillHead = structural.skillHead;
     merged.prompts = promptTail.map((entry) => ({ ...entry.value }));
     applySkillHead(merged, skillHead);
     merged.seenUuids = new Set<string>();
@@ -2431,6 +2693,14 @@ export async function updateClaudeUsageIndex(
       ...previousAnalysisRuntime.uuidLayers,
       ...(analysisUuidAdditions.size > 0 ? [analysisUuidAdditions] : []),
     ]);
+    const firstUuidFileByUuid = analysisUuidAdditions.size > 0
+      ? new Map(previousAnalysisRuntime.firstUuidFileByUuid)
+      : previousAnalysisRuntime.firstUuidFileByUuid;
+    if (firstUuidFileByUuid instanceof Map) {
+      for (const uuid of analysisUuidAdditions) {
+        firstUuidFileByUuid.set(uuid, parsedPlans[0]?.fileId ?? '');
+      }
+    }
     const calibrationState = appendCalibration(
       previous,
       next,
@@ -2444,12 +2714,17 @@ export async function updateClaudeUsageIndex(
       asOfDay: analysisAsOfDay,
       cutoffMs: analysisCutoffMs,
       orderedFileIds: previousAnalysisRuntime.orderedFileIds,
+      filePositionById: previousAnalysisRuntime.filePositionById,
       merged,
       promptTail,
       skillHead,
       calibration: calibrationState.calibration,
       calibrationOldestTimestampMs: calibrationState.oldestTimestampMs,
       uuidLayers,
+      firstUuidFileByUuid,
+      toolEventsById: structural.toolEventsById,
+      toolBucketsById: structural.toolBucketsById,
+      firstToolResultByName: structural.firstToolResultByName,
     };
     analysisRuntimeByIndex.set(next, runtime);
     next.contentAnalysis = finalizeMaterializedAnalysis(runtime);
