@@ -23,6 +23,7 @@ import {
   createEmptyQuotaObservationStore,
   mergeQuotaCaptures,
 } from '../quotaObservationStore';
+import { I18n } from '../i18n';
 
 type ExtensionModule = typeof import('../extension');
 
@@ -1444,6 +1445,122 @@ test('Codex watcher errors close the whole set and recover with bounded backoff'
     globalThis.setTimeout = originalSetTimeout;
     globalThis.clearTimeout = originalClearTimeout;
     fs.rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('unchanged Claude history republishes Today and rolling 30 days at configured-zone midnight', async () => {
+  const extension = bareExtension();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ccu-claude-midnight-'));
+  const project = path.join(root, 'projects', '-fixture');
+  fs.mkdirSync(project, { recursive: true });
+  const usageLine = (id: string, timestamp: string, input: number): string =>
+    JSON.stringify({
+      type: 'assistant',
+      timestamp,
+      cwd: '/fixture/project',
+      gitBranch: 'main',
+      requestId: `request-${id}`,
+      message: {
+        id: `message-${id}`,
+        model: 'claude-sonnet-4-5',
+        content: [{ type: 'text', text: `answer-${id}` }],
+        usage: {
+          input_tokens: input,
+          output_tokens: 1,
+          cache_creation_input_tokens: 2,
+          cache_read_input_tokens: 3,
+        },
+      },
+    });
+  fs.writeFileSync(
+    path.join(project, 'session-root.jsonl'),
+    [
+      usageLine('rolling-boundary', '2030-02-09T04:00:00.000Z', 100),
+      usageLine('today', '2030-03-10T15:30:00.000Z', 10),
+    ].join('\n') + '\n',
+    'utf8',
+  );
+
+  const originalNow = Date.now;
+  const originalTimeZone = I18n.getTimezone();
+  let now = Date.parse('2030-03-10T15:59:30.000Z');
+  Date.now = () => now;
+  I18n.setTimezone('Asia/Hong_Kong');
+  extension.localDataClearedRequiresReload = false;
+  extension.refreshGate = new RefreshSingleFlight();
+  extension.quotaColdRetryDone = true;
+  extension.cache = {
+    records: [],
+    contentAnalysis: null,
+    claudeIndex: createClaudeUsageIndex(),
+    manifest: null,
+    lastUpdate: new Date(0),
+    dataDirectory: null,
+    usageLimits: null,
+    usageLimitsLastUpdate: new Date(0),
+    usageLimitsBackoffUntil: new Date(0),
+    usageLimitsFailStreak: 0,
+  };
+  extension.getConfiguration = () => ({
+    dataDirectory: root,
+    dashboardAutoRefresh: true,
+    enableContentAnalysis: false,
+    advicePromptWindowDays: 30,
+    projectGroupingMode: 'git',
+    contextWindowOverride: 0,
+    timezone: 'Asia/Hong_Kong',
+  });
+  extension.refreshCodexData = () => undefined;
+  extension.maybeFetchUsageLimits = async () => null;
+  extension.syncProviderUi = () => undefined;
+  const diagnostics: string[] = [];
+  extension.outputChannel = { appendLine: (line: string) => diagnostics.push(line) };
+  const statusTodaySnapshots: number[] = [];
+  extension.statusBar = {
+    setLoading: () => undefined,
+    updateQuota: () => undefined,
+    updateContext: () => undefined,
+    updateUsageData: (
+      today: { totalInputTokens?: number } | null,
+      _workspaceToday: unknown,
+      _error: unknown,
+      _limits: unknown,
+      _month: unknown,
+    ) => statusTodaySnapshots.push(today?.totalInputTokens ?? 0),
+  };
+  const dashboardSnapshots: Array<{ today: number; rolling30: number }> = [];
+  extension.webviewProvider = {
+    setLoading: () => undefined,
+    updateQuota: () => undefined,
+    updateData: (
+      _session: unknown,
+      today: { totalInputTokens?: number } | null,
+      rolling30: { totalInputTokens?: number } | null,
+    ) => dashboardSnapshots.push({
+      today: today?.totalInputTokens ?? 0,
+      rolling30: rolling30?.totalInputTokens ?? 0,
+    }),
+  };
+
+  try {
+    await extension.refreshData(true, 'manual');
+    now = Date.parse('2030-03-10T16:00:30.000Z');
+    await extension.refreshData(false, 'poll');
+
+    assert.equal(dashboardSnapshots.length, 2);
+    assert.equal(statusTodaySnapshots.length, 2);
+    assert.deepEqual(dashboardSnapshots, [
+      { today: 10, rolling30: 110 },
+      { today: 0, rolling30: 10 },
+    ]);
+    assert.deepEqual(statusTodaySnapshots, [10, 0]);
+    assert.equal(extension.cache.records.length, 2);
+    assert.match(diagnostics[diagnostics.length - 1], /changed=0/);
+    assert.match(diagnostics[diagnostics.length - 1], /io\(bytes=0 lines=0\)/);
+  } finally {
+    Date.now = originalNow;
+    I18n.setTimezone(originalTimeZone);
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 

@@ -4146,6 +4146,7 @@ export class ClaudeCodeUsageExtension {
     try {
       if (this.disposed) return;
       const config = this.getConfiguration();
+      const snapshotNow = new Date(Date.now());
       updateWebview = updateWebview || config.dashboardAutoRefresh;
 
       // Account quota is independent from local JSONL. Do not let a slow OAuth
@@ -4204,11 +4205,51 @@ export class ClaudeCodeUsageExtension {
       });
 
       if (!needFullRefresh) {
-        this.statusBar.updateContext(claudeUsageDashboardSnapshot(this.cache.claudeIndex, {
+        const materialized = claudeUsageDashboardSnapshot(this.cache.claudeIndex, {
           workspacePath: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
           projectGroupingMode: config.projectGroupingMode,
           contextWindowOverride: config.contextWindowOverride,
-        }).context);
+          now: snapshotNow,
+        });
+        this.statusBar.updateContext(materialized.context);
+        const timeZone = this.cache.claudeIndex.timeZone;
+        const publishedDay = dayKeyInZone(this.cache.lastUpdate, timeZone);
+        const snapshotDay = dayKeyInZone(snapshotNow, timeZone);
+        const dayRolledOver =
+          this.cache.lastUpdate.getTime() > 0 &&
+          publishedDay !== snapshotDay;
+        if (dayRolledOver && this.cache.records.length > 0) {
+          this.statusBar.updateUsageData(
+            materialized.today,
+            materialized.workspaceToday,
+            undefined,
+            undefined,
+            materialized.month,
+          );
+          if (updateWebview) {
+            this.webviewProvider.updateData(
+              materialized.session,
+              materialized.today,
+              materialized.last30Days,
+              materialized.allTime,
+              materialized.dailyForLast30Days,
+              materialized.monthlyForAllTime,
+              materialized.hourlyForToday,
+              undefined,
+              dataDirectory,
+              this.cache.records,
+              materialized.sessions,
+              materialized.projects,
+              this.cache.contentAnalysis,
+              materialized.branches,
+              materialized.workflows,
+              materialized.costliestMessages,
+              materialized.hourlyForLast30DaysByDay,
+              materialized.projectUsageMatrix,
+            );
+          }
+          this.cache.lastUpdate = new Date(snapshotNow.getTime());
+        }
         this.cache.manifest = manifest;
         this.cache.dataDirectory = dataDirectory;
         this.outputChannel.appendLine(formatRefreshDiagnostic({
@@ -4290,6 +4331,7 @@ export class ClaudeCodeUsageExtension {
           workspacePath,
           projectGroupingMode: config.projectGroupingMode,
           contextWindowOverride: config.contextWindowOverride,
+          now: snapshotNow,
         });
         const sessionData = materialized.session;
         const todayData = materialized.today;
@@ -4328,7 +4370,7 @@ export class ClaudeCodeUsageExtension {
           this.cache.claudeIndex = loaded.index;
           this.cache.manifest = nextManifest;
           this.cache.dataDirectory = dataDirectory;
-          this.cache.lastUpdate = new Date();
+          this.cache.lastUpdate = new Date(snapshotNow.getTime());
         }
       );
       this.outputChannel.appendLine(formatRefreshDiagnostic({

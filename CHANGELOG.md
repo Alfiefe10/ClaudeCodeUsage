@@ -63,6 +63,14 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
   displays `—`.
 
 ### Fixed
+- **Bounded Codex project aggregation** — project previews now index sorted
+  thread rows once instead of rescanning every thread for every project, and
+  last-activity maxima no longer expand history into function arguments.
+- **Quota status contract** — disabling quota tracking hides both Claude and
+  Codex quota status items while preserving the all-off dashboard entry icon.
+- **Claude calendar rollover** — unchanged histories now republish Today and
+  the rolling 30-day snapshot at configured-timezone midnight without
+  rereading JSONL bodies.
 - **Resilient provider watchers** — failed Claude or Codex watchers re-arm with
   bounded exponential backoff while polling remains available; recovery and
   disposal cannot create a retry hot loop.
