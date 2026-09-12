@@ -473,6 +473,46 @@ test('Codex live index progress coalesces dashboard renders', () => {
   }
 });
 
+test('overlapping Codex refresh triggers enter the provider lifecycle once with one strongest follow-up', async () => {
+  const extension = bareExtension();
+  const started: string[] = [];
+  let active = 0;
+  let maxActive = 0;
+  let release!: () => void;
+  const blocker = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  extension.codexRefreshGate = new RefreshSingleFlight();
+  extension.codexCoalescedTriggersSinceRefresh = 0;
+  extension.waitForCodexProviderRetirements = async () => undefined;
+  extension.runCodexRefresh = async (trigger: string) => {
+    started.push(trigger);
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await blocker;
+    active -= 1;
+  };
+
+  const requests = [
+    extension.refreshCodexData('poll'),
+    extension.refreshCodexData('watch'),
+    extension.refreshCodexData('focus'),
+    extension.refreshCodexData('manual'),
+  ];
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(started, ['poll']);
+  assert.equal(maxActive, 1);
+
+  release();
+  await Promise.all(requests);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(started, ['poll', 'manual']);
+  assert.equal(maxActive, 1);
+  assert.equal(extension.activeCodexRefreshes.size, 0);
+});
+
 test('cooldown, user pause, and completed measurement suppress historical backfill', async () => {
   const originalNow = Date.now;
   Date.now = () => 1_001;
