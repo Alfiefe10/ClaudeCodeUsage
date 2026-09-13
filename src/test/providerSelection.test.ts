@@ -415,6 +415,11 @@ test('an unchanged Compare refresh does not assign a new Webview document', () =
 
     provider.updateWebview();
     assert.equal(documentAssignments.length, 1, 'the initial Compare paint assigns one document');
+    assert.equal(
+      provider.compareSnapshotUpdatedAt,
+      CODEX_WEBVIEW_NOW,
+      'the initial Compare snapshot records its render timestamp',
+    );
 
     now += 60_000;
     provider.updateData(null, usage, usage, usage);
@@ -423,6 +428,11 @@ test('an unchanged Compare refresh does not assign a new Webview document', () =
       1,
       'an unchanged provider snapshot remains byte-identical as wall-clock time advances',
     );
+    assert.equal(
+      provider.compareSnapshotUpdatedAt,
+      CODEX_WEBVIEW_NOW,
+      'an unchanged Compare snapshot keeps the same visible update timestamp',
+    );
 
     now += 60_000;
     provider.updateData(null, usage, usage, {
@@ -430,6 +440,11 @@ test('an unchanged Compare refresh does not assign a new Webview document', () =
       totalInputTokens: usage.totalInputTokens + 1,
     });
     assert.equal(documentAssignments.length, 2, 'changed Compare data still assigns a fresh document');
+    assert.equal(
+      provider.compareSnapshotUpdatedAt,
+      now,
+      'changed Compare data advances the visible update timestamp',
+    );
   } finally {
     Date.now = originalNow;
     (Module as any)._load = originalLoad;

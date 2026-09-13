@@ -1562,7 +1562,10 @@ test('changelog preserves v2.3 release order and keeps named candidate fixes out
   const candidateSection = changelog.slice(candidateStart, releasedStart);
   const releasedSection = changelog.slice(releasedStart, previousReleaseStart);
   for (const candidateFix of [
+    'Smoother live Webview refreshes',
+    'Stable unchanged Compare refreshes',
     'Bounded Codex project aggregation',
+    'Single-flight Codex refresh lifecycle',
     'Quota status contract',
     'Claude calendar rollover',
     'Bounded credentials-watcher recovery',
