@@ -276,8 +276,9 @@ Codex 按多 GiB 本地历史设计：
 - Extension Host 的 single-flight 覆盖完整 Codex provider lifecycle，而不只是 worker call。
   一组密集 trigger 只执行当前请求，并至多补跑一次其中优先级最高的 pending trigger；所有调用者
   等待同一个 drain。异常会释放 gate，extension dispose 或本地数据清理则只排空 pending state，
-  不再启动新的 provider 工作。索引 teardown 会在第一次 await 前同步升起暂停栅栏，并一直保持到
-  replacement provider 安装完成；因此排队中的刷新不会在清除或重建期间重新创建索引。
+  不再启动新的 provider 工作。索引 teardown 会在第一次 await 前同步升起暂停栅栏，因此排队中的
+  刷新不会在清除或重建进行期间重新创建索引。成功路径会保持栅栏直到 replacement provider 安装
+  完成；生命周期步骤若失败，则携带原始错误解除栅栏，避免永久阻断后续刷新。
 
 额度历史由同一批 JSONL 解析流程顺便填充。旧的完整索引最多接受一次基于已保存
 last-observed limit 的 metadata-only 播种；不会增加第二套额度扫描器、timer、网络轮询或凭据读取。

@@ -623,6 +623,69 @@ test('Codex refresh parked on provider retirement stops when local data clearing
   assert.equal(extension.codexRefreshDrain, null);
 });
 
+test('Codex refresh parked on provider retirement stops when index teardown begins', async () => {
+  const extension = bareExtension();
+  let finishRetirement!: () => void;
+  const retirement = new Promise<void>((resolve) => {
+    finishRetirement = resolve;
+  });
+  let providerRuns = 0;
+  extension.waitForCodexProviderRetirements = async () => {
+    await retirement;
+  };
+  extension.runCodexRefresh = async () => {
+    providerRuns += 1;
+  };
+
+  const refresh = extension.refreshCodexData('poll');
+  await new Promise((resolve) => setImmediate(resolve));
+  extension.codexRefreshSuspensionDepth += 1;
+  finishRetirement();
+  await refresh;
+  extension.codexRefreshSuspensionDepth -= 1;
+
+  assert.equal(providerRuns, 0);
+  assert.equal(extension.codexRefreshDrain, null);
+});
+
+test('Codex index teardown and the real refresh drain cannot revive a queued follow-up', async () => {
+  const extension = bareExtension();
+  const started: string[] = [];
+  let releaseRefresh!: () => void;
+  const refreshBlocker = new Promise<void>((resolve) => {
+    releaseRefresh = resolve;
+  });
+  extension.runCodexRefresh = async (trigger: string) => {
+    started.push(trigger);
+    if (started.length === 1) await refreshBlocker;
+  };
+  extension.waitForCodexProviderRetirements = async () => undefined;
+  extension.stopCodexWatching = () => undefined;
+  extension.cancelCodexProviderAndWait = async () => undefined;
+  extension.releaseCodexOwnership = async () => undefined;
+  extension.context.globalStorageUri = { fsPath: '/fixture/storage' };
+  extension.removeDerivedFileFamilyWithLease = async () => undefined;
+  extension.saveCodexBackgroundState = async () => undefined;
+  extension.getConfiguration = () => ({ codexEnabled: true });
+  extension.createCodexProvider = () => ({ dispose: async () => undefined });
+  extension.syncProviderUi = () => undefined;
+  extension.codexProvider = { dispose: async () => undefined };
+
+  const first = extension.refreshCodexData('poll');
+  await new Promise((resolve) => setImmediate(resolve));
+  const queued = extension.refreshCodexData('manual');
+  const clearing = extension.clearCodexDerivedIndex(false);
+  assert.equal(extension.codexRefreshSuspensionDepth, 1);
+  releaseRefresh();
+  await Promise.all([first, queued, clearing]);
+
+  assert.deepEqual(started, ['poll']);
+  assert.equal(extension.codexRefreshSuspensionDepth, 0);
+  assert.equal(extension.codexRefreshDrain, null);
+  await extension.refreshCodexData('manual');
+  assert.deepEqual(started, ['poll', 'manual']);
+});
+
 test('Codex index rebuild suspends refreshes until the replacement provider is installed', async () => {
   const extension = bareExtension();
   const calls: string[] = [];
