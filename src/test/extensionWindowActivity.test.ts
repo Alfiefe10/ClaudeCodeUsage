@@ -81,6 +81,7 @@ function bareExtension(): any {
   extension.codexCoalescedTriggersSinceRefresh = 0;
   extension.codexRefreshGate = new RefreshSingleFlight();
   extension.codexRefreshDrain = null;
+  extension.codexRefreshSuspensionDepth = 0;
   extension.codexWatchDebouncePending = false;
   extension.disposed = false;
   extension.codexBackgroundState = createBackgroundWorkState({
@@ -569,6 +570,142 @@ test('Codex refresh single-flight drops a queued follow-up after disposal begins
 
   assert.deepEqual(started, ['poll']);
   assert.equal(extension.codexRefreshDrain, null);
+});
+
+test('Codex refresh single-flight drops a queued follow-up across index teardown', async () => {
+  const extension = bareExtension();
+  const started: string[] = [];
+  let release!: () => void;
+  const blocker = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  extension.codexRefreshSuspensionDepth = 0;
+  extension.runScheduledCodexRefresh = async (trigger: string) => {
+    started.push(trigger);
+    if (started.length === 1) await blocker;
+  };
+
+  const first = extension.refreshCodexData('poll');
+  const queued = extension.refreshCodexData('manual');
+  await new Promise((resolve) => setImmediate(resolve));
+  extension.codexRefreshSuspensionDepth += 1;
+  release();
+  await Promise.all([first, queued]);
+
+  assert.deepEqual(started, ['poll']);
+  extension.codexRefreshSuspensionDepth -= 1;
+  await extension.refreshCodexData('manual');
+  assert.deepEqual(started, ['poll', 'manual']);
+  assert.equal(extension.codexRefreshDrain, null);
+});
+
+test('Codex refresh parked on provider retirement stops when local data clearing begins', async () => {
+  const extension = bareExtension();
+  let finishRetirement!: () => void;
+  const retirement = new Promise<void>((resolve) => {
+    finishRetirement = resolve;
+  });
+  let providerRuns = 0;
+  extension.waitForCodexProviderRetirements = async () => {
+    await retirement;
+  };
+  extension.runCodexRefresh = async () => {
+    providerRuns += 1;
+  };
+
+  const refresh = extension.refreshCodexData('poll');
+  await new Promise((resolve) => setImmediate(resolve));
+  extension.localDataClearedRequiresReload = true;
+  finishRetirement();
+  await refresh;
+
+  assert.equal(providerRuns, 0);
+  assert.equal(extension.codexRefreshDrain, null);
+});
+
+test('Codex index rebuild suspends refreshes until the replacement provider is installed', async () => {
+  const extension = bareExtension();
+  const calls: string[] = [];
+  let finishRetirement!: () => void;
+  const retirement = new Promise<void>((resolve) => {
+    finishRetirement = resolve;
+  });
+  const retiring = {
+    dispose: async () => {
+      calls.push(`dispose:${extension.codexRefreshSuspensionDepth}`);
+    },
+  };
+  extension.codexProvider = retiring;
+  extension.windowActivity = new WindowActivityGate(true);
+  extension.stopCodexWatching = () => {
+    calls.push(`stop:${extension.codexRefreshSuspensionDepth}`);
+  };
+  extension.waitForCodexProviderRetirements = async () => {
+    calls.push(`retire:${extension.codexRefreshSuspensionDepth}`);
+    await retirement;
+  };
+  extension.cancelCodexProviderAndWait = async () => {
+    calls.push(`cancel:${extension.codexRefreshSuspensionDepth}`);
+  };
+  extension.releaseCodexOwnership = async () => {
+    calls.push(`release:${extension.codexRefreshSuspensionDepth}`);
+  };
+  extension.context.globalStorageUri = { fsPath: '/fixture/storage' };
+  extension.removeDerivedFileFamilyWithLease = async () => {
+    calls.push(`remove:${extension.codexRefreshSuspensionDepth}`);
+  };
+  extension.saveCodexBackgroundState = async () => {
+    calls.push(`save:${extension.codexRefreshSuspensionDepth}`);
+  };
+  extension.createCodexProvider = () => {
+    calls.push(`replace:${extension.codexRefreshSuspensionDepth}`);
+    return { dispose: async () => undefined };
+  };
+  extension.syncProviderUi = () => {
+    calls.push(`sync:${extension.codexRefreshSuspensionDepth}`);
+  };
+  extension.getConfiguration = () => ({ codexEnabled: true });
+  extension.refreshCodexData = async (trigger: string) => {
+    calls.push(`refresh:${trigger}:${extension.codexRefreshSuspensionDepth}`);
+  };
+  extension.startCodexWatching = () => {
+    calls.push(`start:${extension.codexRefreshSuspensionDepth}`);
+  };
+
+  const clearing = extension.clearCodexDerivedIndex(true);
+  assert.equal(extension.codexRefreshSuspensionDepth, 1);
+  finishRetirement();
+  await clearing;
+
+  assert.deepEqual(calls, [
+    'stop:1',
+    'retire:1',
+    'cancel:1',
+    'dispose:1',
+    'release:1',
+    'remove:1',
+    'save:1',
+    'replace:1',
+    'sync:1',
+    'refresh:manual:0',
+    'start:0',
+  ]);
+  assert.equal(extension.codexRefreshSuspensionDepth, 0);
+});
+
+test('Codex index teardown releases refresh suspension after a lifecycle failure', async () => {
+  const extension = bareExtension();
+  extension.stopCodexWatching = () => undefined;
+  extension.waitForCodexProviderRetirements = async () => {
+    throw new Error('retirement failed');
+  };
+
+  await assert.rejects(
+    extension.clearCodexDerivedIndex(false),
+    /retirement failed/,
+  );
+
+  assert.equal(extension.codexRefreshSuspensionDepth, 0);
 });
 
 test('cooldown, user pause, and completed measurement suppress historical backfill', async () => {

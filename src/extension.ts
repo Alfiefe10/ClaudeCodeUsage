@@ -422,6 +422,7 @@ export class ClaudeCodeUsageExtension {
   private readonly refreshGate = new RefreshSingleFlight();
   private readonly codexRefreshGate = new RefreshSingleFlight();
   private codexRefreshDrain: Promise<void> | null = null;
+  private codexRefreshSuspensionDepth = 0;
   private readonly windowActivity =
     new WindowActivityGate(vscode.window.state.focused);
   private watcherEventsSinceRefresh = 0;
@@ -1585,31 +1586,36 @@ export class ClaudeCodeUsageExtension {
 
   private async clearCodexDerivedIndex(rebuild: boolean): Promise<void> {
     const generation = ++this.configurationGeneration;
-    this.stopCodexWatching('settings-change');
-    this.codexWorkerCancellationRequested = true;
-    await this.waitForCodexProviderRetirements();
-    const retiring = this.codexProvider;
-    await this.cancelCodexProviderAndWait(retiring);
-    while (this.activeCodexRefreshes.size > 0) {
-      await Promise.allSettled([...this.activeCodexRefreshes]);
+    this.codexRefreshSuspensionDepth += 1;
+    try {
+      this.stopCodexWatching('settings-change');
+      this.codexWorkerCancellationRequested = true;
+      await this.waitForCodexProviderRetirements();
+      const retiring = this.codexProvider;
+      await this.cancelCodexProviderAndWait(retiring);
+      while (this.activeCodexRefreshes.size > 0) {
+        await Promise.allSettled([...this.activeCodexRefreshes]);
+      }
+      await retiring.dispose();
+      await this.releaseCodexOwnership('settings-change');
+      const indexPath = path.join(this.context.globalStorageUri.fsPath, 'codex-index-v1.json');
+      await this.removeDerivedFileFamilyWithLease(indexPath, 'codex-index');
+      this.codexView = null;
+      this.codexInsights = emptyCodexScopedInsights();
+      this.codexHasData = false;
+      this.codexRefreshing = false;
+      this.codexProgress = null;
+      this.codexBackgroundState = createBackgroundWorkState({
+        measurementVersion: ClaudeCodeUsageExtension.CODEX_BACKGROUND_MEASUREMENT_VERSION,
+        reason: 'first-index',
+        now: Date.now(),
+      });
+      await this.saveCodexBackgroundState();
+      this.codexProvider = this.createCodexProvider(this.getConfiguration());
+      this.syncProviderUi();
+    } finally {
+      this.codexRefreshSuspensionDepth -= 1;
     }
-    await retiring.dispose();
-    await this.releaseCodexOwnership('settings-change');
-    const indexPath = path.join(this.context.globalStorageUri.fsPath, 'codex-index-v1.json');
-    await this.removeDerivedFileFamilyWithLease(indexPath, 'codex-index');
-    this.codexView = null;
-    this.codexInsights = emptyCodexScopedInsights();
-    this.codexHasData = false;
-    this.codexRefreshing = false;
-    this.codexProgress = null;
-    this.codexBackgroundState = createBackgroundWorkState({
-      measurementVersion: ClaudeCodeUsageExtension.CODEX_BACKGROUND_MEASUREMENT_VERSION,
-      reason: 'first-index',
-      now: Date.now(),
-    });
-    await this.saveCodexBackgroundState();
-    this.codexProvider = this.createCodexProvider(this.getConfiguration());
-    this.syncProviderUi();
     if (
       rebuild &&
       !this.disposed &&
@@ -2643,7 +2649,11 @@ export class ClaudeCodeUsageExtension {
   }
 
   private async refreshCodexData(trigger: RefreshTrigger): Promise<void> {
-    if (this.disposed || this.localDataClearedRequiresReload) return;
+    if (
+      this.disposed ||
+      this.localDataClearedRequiresReload ||
+      this.codexRefreshSuspensionDepth > 0
+    ) return;
     const request = this.codexRefreshGate.request(false, trigger);
     if (request === null) {
       this.codexCoalescedTriggersSinceRefresh += 1;
@@ -2666,7 +2676,11 @@ export class ClaudeCodeUsageExtension {
     let request: RefreshRequest | null = initial;
     try {
       while (request !== null) {
-        if (this.disposed || this.localDataClearedRequiresReload) break;
+        if (
+          this.disposed ||
+          this.localDataClearedRequiresReload ||
+          this.codexRefreshSuspensionDepth > 0
+        ) break;
         await this.runScheduledCodexRefresh(request.trigger);
         request = this.codexRefreshGate.complete();
       }
@@ -2687,7 +2701,12 @@ export class ClaudeCodeUsageExtension {
     } catch {
       return;
     }
-    if (this.disposed || generation !== this.configurationGeneration) return;
+    if (
+      this.disposed ||
+      this.localDataClearedRequiresReload ||
+      this.codexRefreshSuspensionDepth > 0 ||
+      generation !== this.configurationGeneration
+    ) return;
     const diagnosticContext = this.takeCodexRefreshDiagnosticContext();
     const operation = this.runCodexRefresh(trigger, diagnosticContext);
     this.activeCodexRefreshes.add(operation);
