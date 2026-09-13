@@ -32,6 +32,7 @@ test('live dashboard patches preserve every local scroller kind and sanitize lan
         const owner = document.createElement('details');
         owner.className = 'advice-payload-preview';
         owner.setAttribute('data-advice-provider', 'claude');
+        owner.open = true;
         scroller = document.createElement('pre');
         owner.appendChild(scroller);
         fixtureRoot.appendChild(owner);
@@ -90,6 +91,10 @@ test('live dashboard patches preserve every local scroller kind and sanitize lan
       badMonth: globalThis.ccuRefreshSafeScrollLandmark('data-month', '/Users/example/private'),
       provider: globalThis.ccuRefreshSafeScrollLandmark('data-project-matrix', 'claude'),
       badProvider: globalThis.ccuRefreshSafeScrollLandmark('data-project-matrix', 'account-secret'),
+      range: globalThis.ccuRefreshSafeScrollLandmark('data-project-matrix-range-panel', '30'),
+      badRange: globalThis.ccuRefreshSafeScrollLandmark('data-project-matrix-range-panel', '365'),
+      adviceProvider: globalThis.ccuRefreshSafeScrollLandmark('data-advice-provider', 'optimizer'),
+      badAdviceProvider: globalThis.ccuRefreshSafeScrollLandmark('data-advice-provider', 'account-secret'),
       valueless: globalThis.ccuRefreshSafeScrollLandmark('data-hourly-overview', ''),
       valuedFlag: globalThis.ccuRefreshSafeScrollLandmark('data-hourly-overview', 'private'),
     };
@@ -108,6 +113,8 @@ test('live dashboard patches preserve every local scroller kind and sanitize lan
   }, scrollerFixtures);
 
   expect(before.entries).toHaveLength(scrollerFixtures.length);
+  expect(before.positions.every(({ scrollLeft, scrollTop }) =>
+    scrollLeft > 0 && scrollTop > 0)).toBe(true);
   expect(new Set(before.entries.map(({ key }) => key.split('|')[1])))
     .toEqual(new Set([
       'dashboard-tabs',
@@ -137,6 +144,10 @@ test('live dashboard patches preserve every local scroller kind and sanitize lan
     badMonth: '',
     provider: 'claude',
     badProvider: '',
+    range: '30',
+    badRange: '',
+    adviceProvider: 'optimizer',
+    badAdviceProvider: '',
     valueless: 'present',
     valuedFlag: '',
   });
