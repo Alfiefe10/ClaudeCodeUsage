@@ -420,6 +420,8 @@ export class ClaudeCodeUsageExtension {
   private codexWatchedHome: string | null = null;
   private readonly watchDebounce = this.createOwnedRefreshDebounce('claude');
   private readonly refreshGate = new RefreshSingleFlight();
+  private readonly codexRefreshGate = new RefreshSingleFlight();
+  private codexRefreshDrain: Promise<void> | null = null;
   private readonly windowActivity =
     new WindowActivityGate(vscode.window.state.focused);
   private watcherEventsSinceRefresh = 0;
@@ -2642,6 +2644,43 @@ export class ClaudeCodeUsageExtension {
 
   private async refreshCodexData(trigger: RefreshTrigger): Promise<void> {
     if (this.disposed || this.localDataClearedRequiresReload) return;
+    const request = this.codexRefreshGate.request(false, trigger);
+    if (request === null) {
+      this.codexCoalescedTriggersSinceRefresh += 1;
+      await (this.codexRefreshDrain ?? Promise.resolve());
+      return;
+    }
+
+    const drain = Promise.resolve().then(() => this.drainCodexRefreshes(request));
+    this.codexRefreshDrain = drain;
+    try {
+      await drain;
+    } finally {
+      if (this.codexRefreshDrain === drain) {
+        this.codexRefreshDrain = null;
+      }
+    }
+  }
+
+  private async drainCodexRefreshes(initial: RefreshRequest): Promise<void> {
+    let request: RefreshRequest | null = initial;
+    try {
+      while (request !== null) {
+        if (this.disposed || this.localDataClearedRequiresReload) break;
+        await this.runScheduledCodexRefresh(request.trigger);
+        request = this.codexRefreshGate.complete();
+      }
+    } finally {
+      // If lifecycle work throws or disposal interrupts a queued follow-up,
+      // drain the gate without starting more provider work. A later explicit
+      // refresh must always be able to acquire a fresh single-flight.
+      while (request !== null) {
+        request = this.codexRefreshGate.complete();
+      }
+    }
+  }
+
+  private async runScheduledCodexRefresh(trigger: RefreshTrigger): Promise<void> {
     const generation = this.configurationGeneration;
     try {
       await this.waitForCodexProviderRetirements();

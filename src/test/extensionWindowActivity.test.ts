@@ -79,6 +79,8 @@ function bareExtension(): any {
   extension.credentialsWatcherMissingFilenameEventsSinceRefresh = 0;
   extension.codexWatcherEventsSinceRefresh = 0;
   extension.codexCoalescedTriggersSinceRefresh = 0;
+  extension.codexRefreshGate = new RefreshSingleFlight();
+  extension.codexRefreshDrain = null;
   extension.codexWatchDebouncePending = false;
   extension.disposed = false;
   extension.codexBackgroundState = createBackgroundWorkState({
@@ -476,6 +478,7 @@ test('Codex live index progress coalesces dashboard renders', () => {
 test('overlapping Codex refresh triggers enter the provider lifecycle once with one strongest follow-up', async () => {
   const extension = bareExtension();
   const started: string[] = [];
+  const coalescedCounts: number[] = [];
   let active = 0;
   let maxActive = 0;
   let release!: () => void;
@@ -485,8 +488,12 @@ test('overlapping Codex refresh triggers enter the provider lifecycle once with 
   extension.codexRefreshGate = new RefreshSingleFlight();
   extension.codexCoalescedTriggersSinceRefresh = 0;
   extension.waitForCodexProviderRetirements = async () => undefined;
-  extension.runCodexRefresh = async (trigger: string) => {
+  extension.runCodexRefresh = async (
+    trigger: string,
+    diagnosticContext: { coalescedTriggers: number },
+  ) => {
     started.push(trigger);
+    coalescedCounts.push(diagnosticContext.coalescedTriggers);
     active += 1;
     maxActive = Math.max(maxActive, active);
     await blocker;
@@ -509,8 +516,59 @@ test('overlapping Codex refresh triggers enter the provider lifecycle once with 
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.deepEqual(started, ['poll', 'manual']);
+  assert.equal(
+    coalescedCounts.reduce((total, count) => total + count, 0),
+    3,
+  );
+  assert.equal(extension.codexCoalescedTriggersSinceRefresh, 0);
   assert.equal(maxActive, 1);
   assert.equal(extension.activeCodexRefreshes.size, 0);
+});
+
+test('Codex refresh single-flight releases the gate after an unexpected scheduler failure', async () => {
+  const extension = bareExtension();
+  const started: string[] = [];
+  let fail = true;
+  extension.runScheduledCodexRefresh = async (trigger: string) => {
+    started.push(trigger);
+    if (fail) {
+      fail = false;
+      throw new Error('scheduler failed');
+    }
+  };
+
+  await assert.rejects(
+    extension.refreshCodexData('poll'),
+    /scheduler failed/,
+  );
+  await extension.refreshCodexData('manual');
+
+  assert.deepEqual(started, ['poll', 'manual']);
+  assert.equal(extension.codexRefreshDrain, null);
+});
+
+test('Codex refresh single-flight drops a queued follow-up after disposal begins', async () => {
+  const extension = bareExtension();
+  const started: string[] = [];
+  let release!: () => void;
+  const blocker = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  extension.runScheduledCodexRefresh = async (trigger: string) => {
+    started.push(trigger);
+    await blocker;
+  };
+
+  const first = extension.refreshCodexData('poll');
+  const queued = extension.refreshCodexData('manual');
+  await new Promise((resolve) => setImmediate(resolve));
+  extension.disposed = true;
+  release();
+  await Promise.all([first, queued]);
+  await extension.refreshCodexData('focus');
+
+  assert.deepEqual(started, ['poll']);
+  assert.equal(extension.codexRefreshDrain, null);
 });
 
 test('cooldown, user pause, and completed measurement suppress historical backfill', async () => {
