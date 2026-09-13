@@ -34,6 +34,9 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
   only the strongest pending follow-up, all callers await the same bounded
   drain, diagnostics retain the coalesced-trigger count, and disposal or local
   data clearing drops queued work instead of starting another index pass.
+  Index teardown also raises a synchronous suspension fence until its replacement
+  provider is installed, so an already queued follow-up cannot recreate the
+  index while it is being cleared or rebuilt.
 - **Quota status contract** — disabling quota tracking hides both Claude and
   Codex quota status items while preserving the all-off dashboard entry icon.
 - **Claude calendar rollover** — unchanged histories now republish Today and

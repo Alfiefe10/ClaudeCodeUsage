@@ -371,7 +371,10 @@ Codex history is designed for multi-gigabyte local corpora:
   not only the worker call. A trigger burst runs the current request and at most
   one follow-up carrying the strongest pending trigger; every caller awaits the
   same drain. Failure releases the gate, while disposal or local-data clearing
-  drains pending state without starting more provider work.
+  drains pending state without starting more provider work. Index teardown adds
+  a synchronous suspension fence before its first await and keeps it raised
+  until the replacement provider is installed; queued refresh work therefore
+  cannot recreate the index during a clear or rebuild.
 
 Quota history is populated opportunistically by those same JSONL passes. An
 older complete index may receive one metadata-only seed from its already saved
