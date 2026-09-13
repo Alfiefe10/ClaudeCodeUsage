@@ -273,7 +273,10 @@ Codex 按多 GiB 本地历史设计：
 - append refresh 只读新 tail；未完成行只留在 scanner 的短期内存，从 safe cursor 重试，绝不写入 v3；
 - truncate/replacement 只重解析受影响文件；
 - cancel checkpoint 会原子保存 per-file contribution 与 migration progress，下一轮从已验证 cursor resume；
-- 并发 refresh 共享同一 worker run。
+- Extension Host 的 single-flight 覆盖完整 Codex provider lifecycle，而不只是 worker call。
+  一组密集 trigger 只执行当前请求，并至多补跑一次其中优先级最高的 pending trigger；所有调用者
+  等待同一个 drain。异常会释放 gate，extension dispose 或本地数据清理则只排空 pending state，
+  不再启动新的 provider 工作。
 
 额度历史由同一批 JSONL 解析流程顺便填充。旧的完整索引最多接受一次基于已保存
 last-observed limit 的 metadata-only 播种；不会增加第二套额度扫描器、timer、网络轮询或凭据读取。

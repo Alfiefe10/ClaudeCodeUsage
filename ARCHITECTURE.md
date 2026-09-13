@@ -367,7 +367,11 @@ Codex history is designed for multi-gigabyte local corpora:
 - truncation/replacement reparses only the affected file;
 - cancellation checkpoints atomically save per-file contributions and migration
   progress, so the next run resumes from the verified cursor;
-- concurrent refresh requests share one worker run.
+- an Extension Host single-flight owns the complete Codex provider lifecycle,
+  not only the worker call. A trigger burst runs the current request and at most
+  one follow-up carrying the strongest pending trigger; every caller awaits the
+  same drain. Failure releases the gate, while disposal or local-data clearing
+  drains pending state without starting more provider work.
 
 Quota history is populated opportunistically by those same JSONL passes. An
 older complete index may receive one metadata-only seed from its already saved

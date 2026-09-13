@@ -29,6 +29,11 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
 - **Bounded Codex project aggregation** — project previews now index sorted
   thread rows once instead of rescanning every thread for every project, and
   last-activity maxima no longer expand history into function arguments.
+- **Single-flight Codex refresh lifecycle** — overlapping poll, watcher, focus,
+  settings, and manual triggers now share one provider lifecycle. A burst keeps
+  only the strongest pending follow-up, all callers await the same bounded
+  drain, diagnostics retain the coalesced-trigger count, and disposal or local
+  data clearing drops queued work instead of starting another index pass.
 - **Quota status contract** — disabling quota tracking hides both Claude and
   Codex quota status items while preserving the all-off dashboard entry icon.
 - **Claude calendar rollover** — unchanged histories now republish Today and
