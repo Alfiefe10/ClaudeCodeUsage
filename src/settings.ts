@@ -780,6 +780,9 @@ export class SettingsStore {
    * the old global configuration entry. This method is idempotent.
    */
   async initializeSecrets(): Promise<void> {
+    // A retry must never leave a previously loaded key available after a
+    // failed migration or SecretStorage read.
+    this.secretValues.clear();
     const secrets = this.context.secrets;
     if (!secrets) {
       throw new SettingsSecretMigrationError('secret-storage-unavailable');
@@ -888,6 +891,19 @@ export class SettingsStore {
         throw error;
       }
       throw new SettingsSecretMigrationError('secret-storage-failed');
+    }
+  }
+
+  /** Secret migration is advice-only; a failure must not disable usage views. */
+  async initializeSecretsForActivation(): Promise<SettingsSecretMigrationErrorCode | null> {
+    try {
+      await this.initializeSecrets();
+      return null;
+    } catch (error) {
+      this.secretValues.clear();
+      return error instanceof SettingsSecretMigrationError
+        ? error.code
+        : 'secret-storage-failed';
     }
   }
 

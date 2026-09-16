@@ -36,7 +36,6 @@ import {
   OWNED_SETTING_GLOBAL_STATE_KEYS,
   REGISTERED_CONFIGURATION_SETTING_KEYS,
   SettingsLocalDataClearError,
-  SettingsSecretMigrationError,
   SettingsStore,
 } from './settings';
 import { normalizeQuotaWindows } from './quotaWindows';
@@ -4661,19 +4660,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const settings = new SettingsStore(context);
   I18n.setLanguage(settings.get<string>('language') as any);
-  try {
-    await settings.initializeSecrets();
-  } catch (error) {
+  const secretMigrationFailure = await settings.initializeSecretsForActivation();
+  if (secretMigrationFailure) {
     const needsManualWorkspaceMigration =
-      error instanceof SettingsSecretMigrationError &&
-      (error.code === 'legacy-secret-conflict' ||
-        error.code === 'workspace-secret-requires-manual-migration');
-    await vscode.window.showErrorMessage(
+      secretMigrationFailure === 'workspace-secret-requires-manual-migration';
+    // Do not await the notification: the status bar and dashboard do not
+    // require BYOK advice and must still activate in every Extension Host.
+    void vscode.window.showWarningMessage(
       needsManualWorkspaceMigration
         ? I18n.t.popup.secretMigrationWorkspace
         : I18n.t.popup.secretMigrationFailed,
     );
-    throw error;
   }
   const quotaRuntime = await initializeQuotaObservationRuntime(context, settings);
   const extension = new ClaudeCodeUsageExtension(

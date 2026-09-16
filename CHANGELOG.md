@@ -7,6 +7,12 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
 ## [2.3.3] — Unreleased
 
 ### Fixed
+- **Startup with legacy workspace advice keys (#105)** — a workspace-scoped
+  plaintext BYOK key or unavailable SecretStorage no longer prevents the usage
+  status bar, commands, and dashboard from activating. The old key remains
+  untouched and is never copied into a global secret; AI advice stays
+  unconfigured until the user completes the manual migration. A localized
+  warning no longer blocks extension startup.
 - **Resilient release delivery** — the verified VSIX is attached to the GitHub
   Release before either registry publish begins, and VS Code Marketplace and
   Open VSX are attempted independently. Both registry uploads use pinned,
