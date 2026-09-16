@@ -36,7 +36,6 @@ import {
   OWNED_SETTING_GLOBAL_STATE_KEYS,
   REGISTERED_CONFIGURATION_SETTING_KEYS,
   SettingsLocalDataClearError,
-  SettingsSecretMigrationError,
   SettingsStore,
 } from './settings';
 import { normalizeQuotaWindows } from './quotaWindows';
@@ -180,7 +179,7 @@ interface WatcherRecoveryState {
   lastFailureAt: number;
 }
 
-type WatcherProvider = 'claude' | 'codex';
+type WatcherProvider = 'claude' | 'codex' | 'credentials';
 type WatcherStopCondition = Extract<
   ResourceStopCondition,
   | 'settled'
@@ -199,6 +198,11 @@ function createWatcherRecoveryState(): WatcherRecoveryState {
     failureStreak: 0,
     lastFailureAt: 0,
   };
+}
+
+interface CodexRefreshDiagnosticContext {
+  watcherEvents: number;
+  coalescedTriggers: number;
 }
 
 const QUOTA_FINGERPRINT_SALT_KEY = 'ccu.quota.fingerprintSalt.v1';
@@ -409,15 +413,23 @@ export class ClaudeCodeUsageExtension {
   private codexWatchers: fs.FSWatcher[] = [];
   private readonly codexWatcherLeases = new Map<fs.FSWatcher, ResourceLease>();
   private codexWatcherRecovery = createWatcherRecoveryState();
+  private credentialsWatcherRecovery = createWatcherRecoveryState();
   private readonly debounceTimerLeases = new Map<NodeJS.Timeout, ResourceLease>();
   private readonly codexWatchDebounce = this.createOwnedRefreshDebounce('codex');
   private codexWatchedHome: string | null = null;
   private readonly watchDebounce = this.createOwnedRefreshDebounce('claude');
   private readonly refreshGate = new RefreshSingleFlight();
+  private readonly codexRefreshGate = new RefreshSingleFlight();
+  private codexRefreshDrain: Promise<void> | null = null;
+  private codexRefreshSuspensionDepth = 0;
   private readonly windowActivity =
     new WindowActivityGate(vscode.window.state.focused);
   private watcherEventsSinceRefresh = 0;
   private coalescedTriggersSinceRefresh = 0;
+  private credentialsWatcherMissingFilenameEventsSinceRefresh = 0;
+  private codexWatcherEventsSinceRefresh = 0;
+  private codexCoalescedTriggersSinceRefresh = 0;
+  private codexWatchDebouncePending = false;
   private watchedDir: string | null = null;
   // Watches ~/.claude/.credentials.json so an account switch is reflected
   // promptly instead of after a full quota TTL (#45).
@@ -1573,31 +1585,36 @@ export class ClaudeCodeUsageExtension {
 
   private async clearCodexDerivedIndex(rebuild: boolean): Promise<void> {
     const generation = ++this.configurationGeneration;
-    this.stopCodexWatching('settings-change');
-    this.codexWorkerCancellationRequested = true;
-    await this.waitForCodexProviderRetirements();
-    const retiring = this.codexProvider;
-    await this.cancelCodexProviderAndWait(retiring);
-    while (this.activeCodexRefreshes.size > 0) {
-      await Promise.allSettled([...this.activeCodexRefreshes]);
+    this.codexRefreshSuspensionDepth += 1;
+    try {
+      this.stopCodexWatching('settings-change');
+      this.codexWorkerCancellationRequested = true;
+      await this.waitForCodexProviderRetirements();
+      const retiring = this.codexProvider;
+      await this.cancelCodexProviderAndWait(retiring);
+      while (this.activeCodexRefreshes.size > 0) {
+        await Promise.allSettled([...this.activeCodexRefreshes]);
+      }
+      await retiring.dispose();
+      await this.releaseCodexOwnership('settings-change');
+      const indexPath = path.join(this.context.globalStorageUri.fsPath, 'codex-index-v1.json');
+      await this.removeDerivedFileFamilyWithLease(indexPath, 'codex-index');
+      this.codexView = null;
+      this.codexInsights = emptyCodexScopedInsights();
+      this.codexHasData = false;
+      this.codexRefreshing = false;
+      this.codexProgress = null;
+      this.codexBackgroundState = createBackgroundWorkState({
+        measurementVersion: ClaudeCodeUsageExtension.CODEX_BACKGROUND_MEASUREMENT_VERSION,
+        reason: 'first-index',
+        now: Date.now(),
+      });
+      await this.saveCodexBackgroundState();
+      this.codexProvider = this.createCodexProvider(this.getConfiguration());
+      this.syncProviderUi();
+    } finally {
+      this.codexRefreshSuspensionDepth -= 1;
     }
-    await retiring.dispose();
-    await this.releaseCodexOwnership('settings-change');
-    const indexPath = path.join(this.context.globalStorageUri.fsPath, 'codex-index-v1.json');
-    await this.removeDerivedFileFamilyWithLease(indexPath, 'codex-index');
-    this.codexView = null;
-    this.codexInsights = emptyCodexScopedInsights();
-    this.codexHasData = false;
-    this.codexRefreshing = false;
-    this.codexProgress = null;
-    this.codexBackgroundState = createBackgroundWorkState({
-      measurementVersion: ClaudeCodeUsageExtension.CODEX_BACKGROUND_MEASUREMENT_VERSION,
-      reason: 'first-index',
-      now: Date.now(),
-    });
-    await this.saveCodexBackgroundState();
-    this.codexProvider = this.createCodexProvider(this.getConfiguration());
-    this.syncProviderUi();
     if (
       rebuild &&
       !this.disposed &&
@@ -2620,16 +2637,77 @@ export class ClaudeCodeUsageExtension {
     }
   }
 
+  private takeCodexRefreshDiagnosticContext(): CodexRefreshDiagnosticContext {
+    const context = {
+      watcherEvents: this.codexWatcherEventsSinceRefresh ?? 0,
+      coalescedTriggers: this.codexCoalescedTriggersSinceRefresh ?? 0,
+    };
+    this.codexWatcherEventsSinceRefresh = 0;
+    this.codexCoalescedTriggersSinceRefresh = 0;
+    return context;
+  }
+
   private async refreshCodexData(trigger: RefreshTrigger): Promise<void> {
-    if (this.disposed || this.localDataClearedRequiresReload) return;
+    if (
+      this.disposed ||
+      this.localDataClearedRequiresReload ||
+      this.codexRefreshSuspensionDepth > 0
+    ) return;
+    const request = this.codexRefreshGate.request(false, trigger);
+    if (request === null) {
+      this.codexCoalescedTriggersSinceRefresh += 1;
+      await (this.codexRefreshDrain ?? Promise.resolve());
+      return;
+    }
+
+    const drain = Promise.resolve().then(() => this.drainCodexRefreshes(request));
+    this.codexRefreshDrain = drain;
+    try {
+      await drain;
+    } finally {
+      if (this.codexRefreshDrain === drain) {
+        this.codexRefreshDrain = null;
+      }
+    }
+  }
+
+  private async drainCodexRefreshes(initial: RefreshRequest): Promise<void> {
+    let request: RefreshRequest | null = initial;
+    try {
+      while (request !== null) {
+        if (
+          this.disposed ||
+          this.localDataClearedRequiresReload ||
+          this.codexRefreshSuspensionDepth > 0
+        ) break;
+        await this.runScheduledCodexRefresh(request.trigger);
+        request = this.codexRefreshGate.complete();
+      }
+    } finally {
+      // If lifecycle work throws or disposal interrupts a queued follow-up,
+      // drain the gate without starting more provider work. A later explicit
+      // refresh must always be able to acquire a fresh single-flight.
+      while (request !== null) {
+        request = this.codexRefreshGate.complete();
+      }
+    }
+  }
+
+  private async runScheduledCodexRefresh(trigger: RefreshTrigger): Promise<void> {
     const generation = this.configurationGeneration;
     try {
       await this.waitForCodexProviderRetirements();
     } catch {
       return;
     }
-    if (this.disposed || generation !== this.configurationGeneration) return;
-    const operation = this.runCodexRefresh(trigger);
+    if (
+      this.disposed ||
+      this.localDataClearedRequiresReload ||
+      this.codexRefreshSuspensionDepth > 0 ||
+      generation !== this.configurationGeneration
+    ) return;
+    const diagnosticContext = this.takeCodexRefreshDiagnosticContext();
+    const operation = this.runCodexRefresh(trigger, diagnosticContext);
     this.activeCodexRefreshes.add(operation);
     try {
       await operation;
@@ -2643,7 +2721,12 @@ export class ClaudeCodeUsageExtension {
       if (this.disposed) return;
       this.outputChannel.appendLine(
         formatCodexIndexDiagnostic({
+          trigger,
           outcome: 'error',
+          watcherEvents: diagnosticContext.watcherEvents,
+          coalescedTriggers: diagnosticContext.coalescedTriggers,
+          backfillMode: 'unknown',
+          workerMode: 'unknown',
           indexedFiles: 0,
           totalFiles: 0,
           indexedBytes: 0,
@@ -2677,12 +2760,16 @@ export class ClaudeCodeUsageExtension {
     provider.cancel();
   }
 
-  private async runCodexRefresh(trigger: RefreshTrigger): Promise<void> {
+  private async runCodexRefresh(
+    trigger: RefreshTrigger,
+    diagnosticContext = this.takeCodexRefreshDiagnosticContext(),
+  ): Promise<void> {
     if (this.disposed) return;
     let ownedBackfillLease: ResourceLease | undefined;
     let ownedWorkerLease: ResourceLease | undefined;
     let workerStoppedSafely = false;
     let continueHistoricalWork = false;
+    const workerMode = codexRefreshProfileForTrigger(trigger);
     const config = this.getConfiguration();
     if (!config.codexEnabled) {
       await this.cancelCodexProviderAndWait();
@@ -2842,7 +2929,7 @@ export class ClaudeCodeUsageExtension {
         this.codexWorkerCancellationRequested = false;
       }
       const result = await provider.refresh(
-        codexRefreshProfileForTrigger(trigger),
+        workerMode,
         (progress) => this.onCodexIndexProgress(progress),
         historicalAttempt,
       );
@@ -2915,7 +3002,12 @@ export class ClaudeCodeUsageExtension {
       }
       this.outputChannel.appendLine(
         formatCodexIndexDiagnostic({
+          trigger,
           outcome: result.outcome,
+          watcherEvents: diagnosticContext.watcherEvents,
+          coalescedTriggers: diagnosticContext.coalescedTriggers,
+          backfillMode: historicalAttempt ? 'historical' : 'steady',
+          workerMode,
           indexedFiles: result.snapshot.coverage.indexedFiles,
           totalFiles: result.snapshot.coverage.totalFiles,
           indexedBytes: result.snapshot.coverage.indexedBytes,
@@ -3281,8 +3373,12 @@ export class ClaudeCodeUsageExtension {
       this.claudeWatcherRecovery ??= createWatcherRecoveryState();
       return this.claudeWatcherRecovery;
     }
-    this.codexWatcherRecovery ??= createWatcherRecoveryState();
-    return this.codexWatcherRecovery;
+    if (provider === 'codex') {
+      this.codexWatcherRecovery ??= createWatcherRecoveryState();
+      return this.codexWatcherRecovery;
+    }
+    this.credentialsWatcherRecovery ??= createWatcherRecoveryState();
+    return this.credentialsWatcherRecovery;
   }
 
   private markWatcherHealthy(provider: WatcherProvider): void {
@@ -3315,7 +3411,12 @@ export class ClaudeCodeUsageExtension {
     provider: WatcherProvider,
     error: unknown,
   ): void {
-    if (this.disposed || !this.windowActivity.focused) return;
+    if (
+      this.disposed ||
+      this.localDataClearedRequiresReload ||
+      !this.windowActivity.focused ||
+      (provider === 'credentials' && !this.getConfiguration().usageLimitTracking)
+    ) return;
     const state = this.watcherRecoveryState(provider);
     if (state.timer) return;
     const now = Date.now();
@@ -3333,15 +3434,23 @@ export class ClaudeCodeUsageExtension {
     const code = typeof rawCode === 'string' && /^[A-Za-z0-9_-]{1,32}$/.test(rawCode)
       ? rawCode
       : 'watch-error';
-    const label = provider === 'claude' ? 'Claude' : 'Codex';
+    const label = provider === 'claude'
+      ? 'Claude'
+      : provider === 'codex'
+        ? 'Codex'
+        : 'Claude credentials';
     this.outputChannel.appendLine(
       `${label} file watcher stopped (${code}); retrying in ${delayMs / 1000}s; polling remains active.`,
     );
 
     const lease = this.resourceOwnership.register({
       kind: 'timer',
-      capability: provider === 'claude' ? 'refresh' : 'codex-index',
-      scope: provider,
+      capability: provider === 'claude'
+        ? 'refresh'
+        : provider === 'codex'
+          ? 'codex-index'
+          : 'quota',
+      scope: provider === 'credentials' ? 'claude' : provider,
       creator: 'refresh-coordinator',
       stopConditions: [
         'settled',
@@ -3362,11 +3471,18 @@ export class ClaudeCodeUsageExtension {
       if (lease.active) {
         this.trackResourceStop(lease.stop('settled', () => undefined));
       }
-      if (this.disposed || !this.windowActivity.focused) return;
+      if (
+        this.disposed ||
+        this.localDataClearedRequiresReload ||
+        !this.windowActivity.focused ||
+        (provider === 'credentials' && !this.getConfiguration().usageLimitTracking)
+      ) return;
       if (provider === 'claude') {
         void this.startFileWatching(true);
-      } else {
+      } else if (provider === 'codex') {
         this.startCodexWatching(true);
+      } else {
+        this.startCredentialsWatching(true);
       }
     }, delayMs);
     state.timer = timer;
@@ -3552,7 +3668,13 @@ export class ClaudeCodeUsageExtension {
               this.stopCodexWatching('feature-disabled');
               return;
             }
+            this.codexWatcherEventsSinceRefresh += 1;
+            if (this.codexWatchDebouncePending) {
+              this.codexCoalescedTriggersSinceRefresh += 1;
+            }
+            this.codexWatchDebouncePending = true;
             this.codexWatchDebounce.push(delaySeconds * 1000, () => {
+              this.codexWatchDebouncePending = false;
               void this.refreshCodexData('watch');
             });
           },
@@ -3599,6 +3721,7 @@ export class ClaudeCodeUsageExtension {
   ): void {
     this.codexWatcherGeneration += 1;
     this.codexWatchDebounce.clear();
+    this.codexWatchDebouncePending = false;
     for (const watcher of this.codexWatchers) {
       const close = (): void => {
         try {
@@ -3636,23 +3759,40 @@ export class ClaudeCodeUsageExtension {
    * and filters by name. macOS Keychain-stored credentials have no file to
    * watch — those still self-correct on the next refresh tick.
    */
-  private startCredentialsWatching(): void {
+  private startCredentialsWatching(recoveryAttempt = false): void {
     if (this.disposed || this.localDataClearedRequiresReload) return;
+    if (!recoveryAttempt) {
+      this.resetWatcherRecovery('credentials', 'cancelled');
+    }
     if (!this.windowActivity.focused) {
       this.stopCredentialsWatching('window-blur');
       return;
     }
-    this.stopCredentialsWatching();
+    if (!this.getConfiguration().usageLimitTracking) {
+      this.stopCredentialsWatching('feature-disabled');
+      return;
+    }
+    this.closeCredentialsWatcher('settings-change');
     const credsPath = this.apiClient.getCredentialsPath();
     const dir = path.dirname(credsPath);
     const name = path.basename(credsPath);
     if (!fs.existsSync(dir)) {
+      if (recoveryAttempt) {
+        // The profile can disappear briefly during an atomic login/profile
+        // replacement. Keep the existing bounded recovery chain alive without
+        // logging the private path or adding a second polling mechanism.
+        this.scheduleWatcherRecovery('credentials', { code: 'ENOENT' });
+      }
       return;
     }
     try {
       const activeGeneration = this.credentialsWatcherGeneration;
-      this.credsWatcher = fs.watch(dir, (_event, filename) => {
+      const watcher = fs.watch(dir, (_event, filename) => {
         if (this.disposed || activeGeneration !== this.credentialsWatcherGeneration) return;
+        this.markWatcherHealthy('credentials');
+        if (!filename) {
+          this.credentialsWatcherMissingFilenameEventsSinceRefresh += 1;
+        }
         if (filename && String(filename) !== name) {
           return;
         }
@@ -3689,12 +3829,22 @@ export class ClaudeCodeUsageExtension {
             'settled',
             'cancelled',
             'window-blur',
+            'feature-disabled',
             'extension-dispose',
             'settings-change',
             'profile-change',
           ],
           boundedException: 'none',
         });
+      });
+      this.credsWatcher = watcher;
+      watcher.on('error', (error) => {
+        if (
+          this.credsWatcher !== watcher ||
+          activeGeneration !== this.credentialsWatcherGeneration
+        ) return;
+        this.closeCredentialsWatcher('cancelled');
+        this.scheduleWatcherRecovery('credentials', error);
       });
       this.credsWatcherLease = this.resourceOwnership.register({
         kind: 'watcher',
@@ -3703,15 +3853,17 @@ export class ClaudeCodeUsageExtension {
         creator: 'extension',
         stopConditions: [
           'window-blur',
+          'feature-disabled',
           'extension-dispose',
           'settings-change',
           'profile-change',
+          'cancelled',
         ],
         boundedException: 'none',
       });
-    } catch {
-      // Watching unsupported on this platform/filesystem — the refresh tick
-      // still picks up the new account within a TTL.
+    } catch (error) {
+      this.closeCredentialsWatcher('cancelled');
+      this.scheduleWatcherRecovery('credentials', error);
     }
   }
 
@@ -3728,10 +3880,15 @@ export class ClaudeCodeUsageExtension {
     void this.refreshData(false, 'credentials');
   }
 
-  private stopCredentialsWatching(
+  private closeCredentialsWatcher(
     condition: Extract<
       ResourceStopCondition,
-      'window-blur' | 'extension-dispose' | 'settings-change' | 'profile-change'
+      | 'cancelled'
+      | 'window-blur'
+      | 'feature-disabled'
+      | 'extension-dispose'
+      | 'settings-change'
+      | 'profile-change'
     > = 'settings-change',
   ): void {
     this.credentialsWatcherGeneration += 1;
@@ -3760,6 +3917,20 @@ export class ClaudeCodeUsageExtension {
       if (lease?.active) this.trackResourceStop(lease.stop(condition, close));
       else close();
     }
+  }
+
+  private stopCredentialsWatching(
+    condition: Extract<
+      ResourceStopCondition,
+      | 'window-blur'
+      | 'feature-disabled'
+      | 'extension-dispose'
+      | 'settings-change'
+      | 'profile-change'
+    > = 'settings-change',
+  ): void {
+    this.resetWatcherRecovery('credentials', condition);
+    this.closeCredentialsWatcher(condition);
   }
 
   /** True when Claude Code has written a log line in the last 60 s. */
@@ -4138,14 +4309,18 @@ export class ClaudeCodeUsageExtension {
 
   private async runRefresh(request: RefreshRequest): Promise<void> {
     const totalStarted = performance.now();
-    const watcherEvents = this.watcherEventsSinceRefresh;
-    const coalescedTriggers = this.coalescedTriggersSinceRefresh;
+    const watcherEvents = this.watcherEventsSinceRefresh ?? 0;
+    const coalescedTriggers = this.coalescedTriggersSinceRefresh ?? 0;
+    const quotaWatcherMissingFilenameEvents =
+      this.credentialsWatcherMissingFilenameEventsSinceRefresh ?? 0;
     this.watcherEventsSinceRefresh = 0;
     this.coalescedTriggersSinceRefresh = 0;
+    this.credentialsWatcherMissingFilenameEventsSinceRefresh = 0;
     let updateWebview = request.trigger === 'manual';
     try {
       if (this.disposed) return;
       const config = this.getConfiguration();
+      const snapshotNow = new Date(Date.now());
       updateWebview = updateWebview || config.dashboardAutoRefresh;
 
       // Account quota is independent from local JSONL. Do not let a slow OAuth
@@ -4182,6 +4357,7 @@ export class ClaudeCodeUsageExtension {
           linesParsed: 0,
           watcherEvents,
           coalescedTriggers,
+          quotaWatcherMissingFilenameEvents,
           manifestMs: 0,
           readParseMs: 0,
           aggregateRenderMs: 0,
@@ -4204,11 +4380,51 @@ export class ClaudeCodeUsageExtension {
       });
 
       if (!needFullRefresh) {
-        this.statusBar.updateContext(claudeUsageDashboardSnapshot(this.cache.claudeIndex, {
+        const materialized = claudeUsageDashboardSnapshot(this.cache.claudeIndex, {
           workspacePath: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
           projectGroupingMode: config.projectGroupingMode,
           contextWindowOverride: config.contextWindowOverride,
-        }).context);
+          now: snapshotNow,
+        });
+        this.statusBar.updateContext(materialized.context);
+        const timeZone = this.cache.claudeIndex.timeZone;
+        const publishedDay = dayKeyInZone(this.cache.lastUpdate, timeZone);
+        const snapshotDay = dayKeyInZone(snapshotNow, timeZone);
+        const dayRolledOver =
+          this.cache.lastUpdate.getTime() > 0 &&
+          publishedDay !== snapshotDay;
+        if (dayRolledOver && this.cache.records.length > 0) {
+          this.statusBar.updateUsageData(
+            materialized.today,
+            materialized.workspaceToday,
+            undefined,
+            undefined,
+            materialized.month,
+          );
+          if (updateWebview) {
+            this.webviewProvider.updateData(
+              materialized.session,
+              materialized.today,
+              materialized.last30Days,
+              materialized.allTime,
+              materialized.dailyForLast30Days,
+              materialized.monthlyForAllTime,
+              materialized.hourlyForToday,
+              undefined,
+              dataDirectory,
+              this.cache.records,
+              materialized.sessions,
+              materialized.projects,
+              this.cache.contentAnalysis,
+              materialized.branches,
+              materialized.workflows,
+              materialized.costliestMessages,
+              materialized.hourlyForLast30DaysByDay,
+              materialized.projectUsageMatrix,
+            );
+          }
+          this.cache.lastUpdate = new Date(snapshotNow.getTime());
+        }
         this.cache.manifest = manifest;
         this.cache.dataDirectory = dataDirectory;
         this.outputChannel.appendLine(formatRefreshDiagnostic({
@@ -4222,6 +4438,7 @@ export class ClaudeCodeUsageExtension {
           linesParsed: 0,
           watcherEvents,
           coalescedTriggers,
+          quotaWatcherMissingFilenameEvents,
           manifestMs,
           readParseMs: 0,
           aggregateRenderMs: 0,
@@ -4265,6 +4482,7 @@ export class ClaudeCodeUsageExtension {
           aggregateMutations: loaded.diagnostics.aggregateMutations,
           watcherEvents,
           coalescedTriggers,
+          quotaWatcherMissingFilenameEvents,
           manifestMs,
           readParseMs: loaded.diagnostics.readParseMs,
           aggregateRenderMs: 0,
@@ -4290,6 +4508,7 @@ export class ClaudeCodeUsageExtension {
           workspacePath,
           projectGroupingMode: config.projectGroupingMode,
           contextWindowOverride: config.contextWindowOverride,
+          now: snapshotNow,
         });
         const sessionData = materialized.session;
         const todayData = materialized.today;
@@ -4328,7 +4547,7 @@ export class ClaudeCodeUsageExtension {
           this.cache.claudeIndex = loaded.index;
           this.cache.manifest = nextManifest;
           this.cache.dataDirectory = dataDirectory;
-          this.cache.lastUpdate = new Date();
+          this.cache.lastUpdate = new Date(snapshotNow.getTime());
         }
       );
       this.outputChannel.appendLine(formatRefreshDiagnostic({
@@ -4344,6 +4563,7 @@ export class ClaudeCodeUsageExtension {
         aggregateMutations: loaded.diagnostics.aggregateMutations,
         watcherEvents,
         coalescedTriggers,
+        quotaWatcherMissingFilenameEvents,
         manifestMs,
         readParseMs: loaded.diagnostics.readParseMs,
         aggregateRenderMs,
@@ -4364,6 +4584,7 @@ export class ClaudeCodeUsageExtension {
         linesParsed: 0,
         watcherEvents,
         coalescedTriggers,
+        quotaWatcherMissingFilenameEvents,
         manifestMs: 0,
         readParseMs: 0,
         aggregateRenderMs: 0,
@@ -4439,19 +4660,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const settings = new SettingsStore(context);
   I18n.setLanguage(settings.get<string>('language') as any);
-  try {
-    await settings.initializeSecrets();
-  } catch (error) {
+  const secretMigrationFailure = await settings.initializeSecretsForActivation();
+  if (secretMigrationFailure) {
     const needsManualWorkspaceMigration =
-      error instanceof SettingsSecretMigrationError &&
-      (error.code === 'legacy-secret-conflict' ||
-        error.code === 'workspace-secret-requires-manual-migration');
-    await vscode.window.showErrorMessage(
+      secretMigrationFailure === 'workspace-secret-requires-manual-migration';
+    // Do not await the notification: the status bar and dashboard do not
+    // require BYOK advice and must still activate in every Extension Host.
+    void vscode.window.showWarningMessage(
       needsManualWorkspaceMigration
         ? I18n.t.popup.secretMigrationWorkspace
         : I18n.t.popup.secretMigrationFailed,
     );
-    throw error;
   }
   const quotaRuntime = await initializeQuotaObservationRuntime(context, settings);
   const extension = new ClaudeCodeUsageExtension(

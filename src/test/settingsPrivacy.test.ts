@@ -211,6 +211,66 @@ test('workspace-only secrets require explicit migration and every open folder is
   assert.equal(context._secrets.size, 0);
 });
 
+test('activation can continue without a BYOK key when workspace plaintext needs manual migration', async () => {
+  const canary = 'sk-workspace-activation-canary';
+  activeConfiguration = fakeConfiguration({ workspace: canary });
+  activeWorkspaceFolders = [];
+  activeFolderConfigurations = new Map();
+  const context = fakeContext();
+  const store = new SettingsStore(context);
+
+  assert.equal(
+    await store.initializeSecretsForActivation(),
+    'workspace-secret-requires-manual-migration',
+  );
+  assert.equal(store.get('advice.apiKey'), '', 'advice stays disabled until the user migrates the key');
+  assert.equal(store.snapshot().find((entry) => entry.key === 'advice.apiKey')?.configured, false);
+  assert.equal(activeConfiguration.values.workspace, canary, 'the original key remains recoverable');
+  assert.equal(context._secrets.size, 0, 'the workspace key is not copied to global SecretStorage');
+  assert.equal(activeConfiguration.updates.length, 0);
+});
+
+test('activation loads an existing SecretStorage key when no legacy plaintext remains', async () => {
+  activeConfiguration = fakeConfiguration();
+  activeWorkspaceFolders = [];
+  activeFolderConfigurations = new Map();
+  const context = fakeContext({ secrets: new Map([['claudeCodeUsage.secret.advice.apiKey', 'sk-existing-canary']]) });
+  const store = new SettingsStore(context);
+
+  assert.equal(await store.initializeSecretsForActivation(), null);
+  assert.equal(store.get('advice.apiKey'), 'sk-existing-canary');
+  assert.equal(store.snapshot().find((entry) => entry.key === 'advice.apiKey')?.configured, true);
+});
+
+test('activation continues when SecretStorage is unavailable', async () => {
+  activeConfiguration = fakeConfiguration();
+  activeWorkspaceFolders = [];
+  activeFolderConfigurations = new Map();
+  const context = fakeContext();
+  context.secrets = undefined;
+  const store = new SettingsStore(context);
+
+  assert.equal(await store.initializeSecretsForActivation(), 'secret-storage-unavailable');
+  assert.equal(store.get('advice.apiKey'), '');
+});
+
+test('activation continues after SecretStorage failure without retaining a stale BYOK key', async () => {
+  activeConfiguration = fakeConfiguration();
+  activeWorkspaceFolders = [];
+  activeFolderConfigurations = new Map();
+  const context = fakeContext({ state: new Map([['ccu.setting.advice.apiKey', 'sk-recovery-canary']]) });
+  const store = new SettingsStore(context);
+  await store.set('advice.apiKey', 'sk-previous-session-canary');
+  context.secrets.store = async () => { throw new Error('synthetic provider detail'); };
+  context.secrets.delete = async () => { throw new Error('synthetic provider detail'); };
+  context._secrets.clear();
+
+  assert.equal(await store.initializeSecretsForActivation(), 'secret-storage-failed');
+  assert.equal(store.get('advice.apiKey'), '');
+  assert.equal(context._state.get('ccu.setting.advice.apiKey'), 'sk-recovery-canary');
+  assert.doesNotMatch(JSON.stringify(store.snapshot()), /recovery-canary|previous-session-canary/);
+});
+
 test('failed SecretStorage migration leaves legacy plaintext in place for recovery', async () => {
   const canary = 'sk-recovery-canary';
   activeConfiguration = fakeConfiguration();
@@ -401,8 +461,11 @@ test('the extension manifest no longer contributes a plaintext API-key setting',
 
 test('activation reports a fixed localized migration failure without echoing provider errors', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'extension.ts'), 'utf8');
-  assert.match(source, /showErrorMessage\([\s\S]*secretMigrationWorkspace[\s\S]*secretMigrationFailed/);
-  assert.doesNotMatch(source, /secretMigrationFailed[^;]*\.message/);
+  const activation = source.slice(source.indexOf('export async function activate('));
+  assert.match(activation, /initializeSecretsForActivation\(\)/);
+  assert.match(activation, /void vscode\.window\.showWarningMessage\([\s\S]*secretMigrationWorkspace[\s\S]*secretMigrationFailed/);
+  assert.doesNotMatch(activation, /await vscode\.window\.showWarningMessage/);
+  assert.doesNotMatch(activation, /secretMigrationFailed[^;]*\.message/);
 });
 
 test('the tracked bilingual data contract covers quota, retention, clearing, and remote boundaries', () => {

@@ -122,6 +122,14 @@ the token denominator but remain unpriced, so pricing coverage stays visible.
 Claude and Codex time-series layouts share aligned responsive widths and keep
 dense chart/table content inside local keyboard-focusable scrollers.
 
+Provider-panel live patches preserve the page anchor plus non-zero horizontal
+positions for the dashboard tab strip and bounded chart, table, project-matrix,
+heatmap, sharing, and preview scrollers. Those positions are matched with
+privacy-safe structural keys held only for the in-flight patch; they are not
+written per frame to Webview state or sent to the Extension Host. Compare's
+displayed update time is tied to its stable rendered data snapshot, so an
+unchanged refresh remains byte-identical and does not replace the document.
+
 ## Token and limit semantics
 
 Claude records carry Anthropic's four token buckets. The extension validates,
@@ -190,7 +198,12 @@ from user-draft Optimizer calls. Cancellation cannot recall transmitted bytes.
 
 The machine salt lives in VS Code `globalState`, not in the index file. Worker
 progress/results/errors and diagnostics contain anonymous counts and timings,
-not paths or identifiers.
+not paths or identifiers. `refresh:` diagnostics include the bounded trigger,
+Claude-watcher/coalescing counters, and the count of quota-watcher events for
+which the operating system supplied no filename. `codex-index` diagnostics add
+the actual refresh trigger, watcher/debounce counts, historical-backfill mode,
+and foreground/background worker profile; generic failure paths use `unknown`
+rather than infer a mode that was not observed.
 
 ### Schema 3 index contract
 
@@ -265,9 +278,63 @@ per-file index: unchanged refreshes read zero JSONL bodies, appends read only a
 verified tail, and truncate/replace/move/delete changes rebuild only affected
 files and aggregate groups. Content-analysis contributions and the established
 cross-file response-identity rules are updated through the same atomic path.
-A new Extension Host performs one cold in-memory build; watcher-driven refreshes
-do not reread and reaggregate the complete corpus. Codex uses its own quiet
-debounce (default 30 seconds, configurable to Off/10/30/60/120/300).
+Content analysis keeps a process-local materialized accumulator. Its cutoff is
+the same continuously rolling millisecond cutoff used by `ClaudeDataLoader`, not
+a local-midnight approximation. Per-file oldest-admitted timestamps and the
+oldest calibration record act as frontiers: moving the cutoff between frontiers
+changes no result and needs no body read, while whole retained or expired files
+can be rebased from metadata. Crossing a frontier reparses the affected boundary
+and any UUID claimant whose first-owner status may change.
+
+Completed malformed JSONL lines are stable ignored input and therefore do not
+invalidate cutoff metadata or cause repeated body reads. An incomplete JSON
+fragment remains behind the safe cursor, while a syntactically valid JSON value
+at EOF is accepted even without a final newline; a later append must first
+preserve that record boundary. If content analysis is disabled, a timezone
+change may rebucket ordinary usage in memory, but re-enabling analysis rebuilds
+all day-sensitive analysis contributions before any result is published. This
+also covers DST transitions rather than copying stale day keys from the former
+zone.
+
+An ordinary single-file append first reads only the verified tail, applies the
+changed-file delta, and recalibrates only affected canonical response identities.
+Numeric-only structural summaries preserve the legacy accumulator's global
+`tool_use` → `tool_result` map and Skill-preamble attribution across file
+boundaries; warm appends replay only touched tool IDs. Duplicate UUID membership
+uses at most 64 immutable layers, and a direct first-owner map decides whether a
+touched UUID can stay incremental without searching every later file. An
+occasional O(U) compaction replaces rebuilding the full UUID set on every append.
+If a tail preempts a later UUID owner, the provisional result is discarded and
+analysis is rebuilt in the loader's complete file order.
+
+That canonical order retains the bounded timestamp probe itself: a file with
+more than 1 MiB of completed timestamp-less prefix keeps the loader's neutral
+timestamp and discovery rank even if full parsing later encounters a timestamp.
+A relative `discoveryIndex` change among timestamp ties is likewise treated as a
+semantic reorder. New/replaced files, multi-file appends, moves, deletes,
+backward cutoff movement, and an append that gives an ordinarily undated file
+its first probe-visible timestamp use the same correctness-first ordered rebuild.
+Per-file Skill candidates retain numeric matching-result evidence; the global
+5,000-use cap and any earlier-file displacement are applied only during ordered
+materialization.
+
+The slow materialization path is O(F + A + R) in memory (files, retained analysis
+state, and calibration records). Cutoff-only work reads boundary/claimant files;
+source-order changes may reread the complete corpus to re-establish first-owner,
+prompt-order, and skill-cap semantics. The public result still materializes its
+established records array, but content calibration no longer creates a second
+all-record copy. A new Extension Host performs one cold in-memory build. Codex
+uses its own quiet debounce (default 30 seconds, configurable to
+Off/10/30/60/120/300).
+Claude log, Codex log, and Claude credentials-directory watchers all treat
+`fs.watch` as an acceleration path: asynchronous watcher errors close the
+affected handle and use capped exponential re-arming while polling remains the
+fallback. If a failed credentials watcher retries while its profile directory
+is temporarily absent, the same bounded chain continues only while the window
+is focused and quota tracking remains enabled; recreating the directory restores
+one watcher. A filename omitted by the operating system is accepted only by the
+credentials watcher, where the event can represent an atomic credential-file
+replacement and is counted anonymously for diagnosis.
 
 Codex history is designed for multi-gigabyte local corpora:
 
@@ -300,7 +367,16 @@ Codex history is designed for multi-gigabyte local corpora:
 - truncation/replacement reparses only the affected file;
 - cancellation checkpoints atomically save per-file contributions and migration
   progress, so the next run resumes from the verified cursor;
-- concurrent refresh requests share one worker run.
+- an Extension Host single-flight owns the complete Codex provider lifecycle,
+  not only the worker call. A trigger burst runs the current request and at most
+  one follow-up carrying the strongest pending trigger; every caller awaits the
+  same drain. Failure releases the gate, while disposal or local-data clearing
+  drains pending state without starting more provider work. Index teardown adds
+  a synchronous suspension fence before its first await, so queued refresh work
+  cannot recreate the index while a clear or rebuild is active. On the success
+  path the fence remains raised until the replacement provider is installed; a
+  lifecycle failure unwinds it with the original error instead of wedging all
+  future refreshes.
 
 Quota history is populated opportunistically by those same JSONL passes. An
 older complete index may receive one metadata-only seed from its already saved

@@ -102,6 +102,12 @@ Codex 的「今天」指配置时区中的当前自然日，而不是最近任�
 仍独立展示。未知模型计入 Token 分母但保持未定价，因此定价 coverage 始终可见。Claude 与 Codex 的
 时间序列布局使用对齐的响应式宽度，较密集的图表和表格在各自可键盘聚焦的区域内滚动。
 
+Provider panel 的实时 patch 会保留页面 anchor，以及标签栏、图表、表格、项目矩阵、
+热力图、分享区和预览区等有界 scroller 的非零水平位置。匹配只使用本次 patch 期间
+驻留内存的 privacy-safe 结构 key；不会逐帧写入 Webview state，也不会发送给
+Extension Host。Compare 显示的更新时间绑定到稳定的已渲染数据 snapshot，因此
+数据未变化的 refresh 保持 byte-identical，不会替换整份文档。
+
 ## Token 与 limit 语义
 
 Claude record 带 Anthropic 的四个 token bucket。扩展对其校验、去重、求和并按模型计价。
@@ -155,7 +161,10 @@ Advice 同意变更会立即作废 Prepared handle。host 的 pending-write 计�
 owner 取消在途建议请求，与仅含用户草稿的 Optimizer 请求隔离。取消不能追回已传出的字节。
 
 Machine salt 存在 VS Code `globalState`，不写入索引。Worker progress/result/error 与 diagnostics
-只含匿名计数与时间，不含 path 或 ID。
+只含匿名计数与时间，不含 path 或 ID。`refresh:` diagnostics 包含受限的 trigger、Claude
+watcher/coalescing 计数，以及操作系统未提供 filename 的 quota watcher 事件数。`codex-index`
+diagnostics 还会记录实际 refresh trigger、watcher/debounce 计数、历史 backfill 模式与
+foreground/background worker profile；通用失败路径无法确认模式时明确记为 `unknown`，不作猜测。
 
 ### Schema 3 索引契约
 
@@ -205,9 +214,44 @@ dashboard 不再因此一直标为「仍在索引」。
 Claude polling 始终遵守 `refreshInterval`，file watcher 使用配置的 quiet debounce。
 生产 Claude 路径维护内存 per-file 索引：unchanged refresh 的 JSONL body read 为 0，
 append 只读已验证 tail，truncate/replace/move/delete 只重建受影响文件和 aggregate group。
-内容分析 contribution 与既有跨文件 response-identity 规则通过同一原子路径更新。新的
-Extension Host 会执行一次冷内存建索引；watcher 驱动的刷新不会重读、重聚合整个语料。
-Codex 使用独立 quiet debounce（默认 30 秒，可选 Off/10/30/60/120/300）。
+内容分析 contribution 与既有跨文件 response-identity 规则通过同一原子路径更新。内容分析维护
+process-local 的已物化 accumulator，其 cutoff 与 `ClaudeDataLoader` 一样按毫秒连续滚动，而不是
+用本地午夜近似。每个文件记录“已纳入 contribution 的最早时间戳”，校准也记录最早 record，二者
+作为 frontier：cutoff 在 frontier 之间移动不会改变结果，也无需读取正文；可证明整文件保留或
+整文件过期时同样只用元数据 rebase。cutoff 跨过 frontier 时，只重读受影响的边界文件，以及
+first-owner 可能变化的 UUID claimant。
+
+已完整落盘但格式错误的 JSONL 行是稳定的忽略项，不会使 cutoff 元数据失效，也不会造成反复正文
+读取。尚未完整的 JSON fragment 留在安全 cursor 之后等待续写；若 EOF 处已经是语法有效的 JSON，
+即使没有末尾换行也会被接纳，后续 append 则必须先证明原 record 边界仍成立。内容分析关闭期间可以
+在内存中按新时区重分普通用量；再次开启时，所有依赖日期的分析 contribution 必须先重建再发布，
+因此跨 DST 切换也不会沿用旧时区的 day key。
+
+普通的单文件 append 会先只读已验证 tail、应用变化文件 delta，并只重校准受影响的 canonical
+response identity。仅含数字的结构摘要按全局文件顺序保留 legacy accumulator 的
+`tool_use` → `tool_result` 映射和 Skill preamble 归因；warm append 只重放被触及的 tool ID。
+UUID membership 最多查询 64 个 immutable layer，并通过 direct first-owner map 判断本次 UUID
+是否可继续走增量路径，无需搜索排序更后的每个文件；偶发的 O(U) 压实替代每次 append 都重建完整
+UUID set。若 tail 抢占了更后文件的 UUID owner，则丢弃 provisional 结果，并按 full loader 的
+完整文件顺序重建分析。
+
+该 canonical 顺序直接保留 bounded timestamp probe 的结果：若文件开头超过 1 MiB 的完整行均无
+时间戳，即使 full parse 随后遇到时间戳，该文件仍使用 loader 的 neutral timestamp 与 discovery
+rank。时间戳相同的文件若 `discoveryIndex` 相对顺序改变，也属于语义 reorder。新建/替换文件、
+多文件 append、move、delete、cutoff 向后移动，以及普通无时间戳文件 append 后首次出现 probe
+可见时间戳，都走同一 correctness-first 有序重建。每文件 Skill candidate 保留匹配 result 的数字
+证据；全局 5,000 次上限及早期文件造成的 boundary displacement 只在有序物化时应用。
+
+慢物化路径的内存复杂度为 O(F + A + R)（文件、保留的分析状态和校准 record）。仅 cutoff 变化时
+只读取边界/claimant 文件；source order 变化时可能重读完整语料，以重新建立 first-owner、prompt
+顺序和 skill cap 语义。公开结果仍按既有 contract 物化 records array，但内容校准不再额外生成
+第二份全量 record 副本。新的 Extension Host 仍会执行一次冷内存建索引。Codex 使用独立 quiet
+debounce（默认 30 秒，可选 Off/10/30/60/120/300）。
+Claude log、Codex log 与 Claude credentials directory watcher 都只作为 `fs.watch` 加速路径：
+异步 watcher error 会关闭受影响 handle，并在 polling 继续可用时按有上限的指数退避重新挂载。
+如果失败的 credentials watcher 重试时 profile directory 暂时不存在，同一有界链只会在窗口聚焦且
+额度跟踪仍启用时继续；目录重建后只恢复一个 watcher。只有 credentials watcher 接受操作系统省略
+filename 的事件，因为这可能表示 credential file 被原子替换；该类事件仅以匿名计数进入诊断。
 
 Codex 按多 GiB 本地历史设计：
 
@@ -229,7 +273,12 @@ Codex 按多 GiB 本地历史设计：
 - append refresh 只读新 tail；未完成行只留在 scanner 的短期内存，从 safe cursor 重试，绝不写入 v3；
 - truncate/replacement 只重解析受影响文件；
 - cancel checkpoint 会原子保存 per-file contribution 与 migration progress，下一轮从已验证 cursor resume；
-- 并发 refresh 共享同一 worker run。
+- Extension Host 的 single-flight 覆盖完整 Codex provider lifecycle，而不只是 worker call。
+  一组密集 trigger 只执行当前请求，并至多补跑一次其中优先级最高的 pending trigger；所有调用者
+  等待同一个 drain。异常会释放 gate，extension dispose 或本地数据清理则只排空 pending state，
+  不再启动新的 provider 工作。索引 teardown 会在第一次 await 前同步升起暂停栅栏，因此排队中的
+  刷新不会在清除或重建进行期间重新创建索引。成功路径会保持栅栏直到 replacement provider 安装
+  完成；生命周期步骤若失败，则携带原始错误解除栅栏，避免永久阻断后续刷新。
 
 额度历史由同一批 JSONL 解析流程顺便填充。旧的完整索引最多接受一次基于已保存
 last-observed limit 的 metadata-only 播种；不会增加第二套额度扫描器、timer、网络轮询或凭据读取。

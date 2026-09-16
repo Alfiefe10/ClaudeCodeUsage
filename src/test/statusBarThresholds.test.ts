@@ -73,6 +73,48 @@ function bareStatusBar(): any {
   return Object.create(StatusBarManager.prototype) as any;
 }
 
+function statusItem(): any {
+  return {
+    text: '',
+    tooltip: undefined,
+    backgroundColor: undefined,
+    visible: false,
+    show(): void { this.visible = true; },
+    hide(): void { this.visible = false; },
+  };
+}
+
+function codexScope(): any {
+  return {
+    total: {
+      processed: 5_000_000,
+      fresh: 1_000_000,
+      input: 4_500_000,
+      cachedInput: 3_500_000,
+      output: 500_000,
+      reasoning: 100_000,
+    },
+    rootTasks: 1,
+    threads: 1,
+    childThreads: 0,
+    childProcessedShare: 0,
+    childFreshShare: 0,
+    approvalReviewerThreads: 0,
+    approvalReviewerFreshShare: 0,
+    cacheShare: 0.7,
+    durationMs: 1_000,
+    structural: {
+      patchCalls: 0,
+      toolCalls: 0,
+      postPatchToolCalls: 0,
+      compactCount: 0,
+      taskCompleteCount: 0,
+    },
+    models: [],
+    efforts: [],
+  };
+}
+
 /** The fill colour the bar paints, read back off the rendered spans. The inner
  * span carries the fill; the outer track is always #bbbbbb. */
 function barColor(pct: number, thresholds?: unknown): string {
@@ -159,19 +201,79 @@ test('Codex quota tooltip reuses the Claude table, progress bar, and line-broken
   assert.equal(tooltip.supportHtml, true);
 });
 
-test('Codex item warns for the worst rendered window while keeping weekly compact text', () => {
-  const item = (): any => ({
-    text: '',
-    tooltip: undefined,
-    backgroundColor: undefined,
-    visible: false,
-    show(): void { this.visible = true; },
-    hide(): void { this.visible = false; },
-  });
+test('Claude quota visibility follows usage-limit tracking and keeps the all-off navigation icon', () => {
   const manager = bareStatusBar();
-  manager.statusBarItem = item();
-  manager.quotaItem = item();
-  manager.contextItem = item();
+  manager.statusBarItem = statusItem();
+  manager.quotaItem = statusItem();
+  manager.contextItem = statusItem();
+  manager.provider = 'claude';
+  manager.showCost = true;
+  manager.showContext = true;
+  manager.usageLimitTracking = true;
+  manager.quotaFiveHourOnly = false;
+  manager.showResetInBar = false;
+  manager.showScopedWeekly = false;
+  manager.resetCountdownFormat = 'decimal';
+  const resetsAt = new Date(Date.now() + 24 * 60 * 60 * 1_000).toISOString();
+  const quota = {
+    five_hour: { utilization: 25, resets_at: resetsAt },
+    seven_day: { utilization: 40, resets_at: resetsAt },
+  };
+
+  manager.setVisibility(true, true, true);
+  manager.updateQuota(quota);
+  assert.equal(manager.quotaItem.visible, true);
+  assert.ok(manager.quotaItem.tooltip);
+
+  manager.setVisibility(false, false, false);
+  manager.updateQuota(quota);
+  assert.equal(manager.quotaItem.visible, false);
+  assert.equal(manager.statusBarItem.visible, true);
+  assert.equal(manager.statusBarItem.text, '$(graph)');
+});
+
+test('Codex quota visibility follows usage-limit tracking and keeps its navigation icon', () => {
+  const manager = bareStatusBar();
+  manager.statusBarItem = statusItem();
+  manager.quotaItem = statusItem();
+  manager.contextItem = statusItem();
+  manager.provider = 'codex';
+  manager.showCost = true;
+  manager.showContext = true;
+  manager.usageLimitTracking = true;
+  manager.quotaFiveHourOnly = false;
+  manager.showResetInBar = false;
+  manager.showScopedWeekly = false;
+  manager.resetCountdownFormat = 'decimal';
+  const resetsAt = Date.now() + 24 * 60 * 60 * 1_000;
+  const limit = {
+    provider: 'codex',
+    observedAt: Date.now() - 60_000,
+    source: 'local-log',
+    confidence: 'last-observed',
+    windows: [
+      { label: 'primary', usedPercent: 25, windowMinutes: 300, resetsAt },
+      { label: 'secondary', usedPercent: 40, windowMinutes: 10_080, resetsAt },
+    ],
+  };
+
+  manager.setVisibility(true, true, true);
+  manager.renderCodex(codexScope(), 'fresh', limit);
+  assert.equal(manager.quotaItem.visible, true);
+  assert.ok(manager.quotaItem.tooltip);
+
+  manager.setVisibility(false, true, false);
+  manager.renderCodex(codexScope(), 'fresh', limit);
+  assert.equal(manager.quotaItem.visible, false);
+  assert.equal(manager.statusBarItem.visible, true);
+  assert.equal(manager.statusBarItem.text, '$(graph)');
+});
+
+test('Codex item warns for the worst rendered window while keeping weekly compact text', () => {
+  const manager = bareStatusBar();
+  manager.statusBarItem = statusItem();
+  manager.quotaItem = statusItem();
+  manager.contextItem = statusItem();
   manager.showCost = true;
   manager.showContext = true;
   manager.usageLimitTracking = true;
@@ -179,34 +281,7 @@ test('Codex item warns for the worst rendered window while keeping weekly compac
   manager.resetCountdownFormat = 'decimal';
 
   const resetsAt = Date.now() + 24 * 60 * 60 * 1000;
-  manager.renderCodex({
-    total: {
-      processed: 5_000_000,
-      fresh: 1_000_000,
-      input: 4_500_000,
-      cachedInput: 3_500_000,
-      output: 500_000,
-      reasoning: 100_000,
-    },
-    rootTasks: 1,
-    threads: 1,
-    childThreads: 0,
-    childProcessedShare: 0,
-    childFreshShare: 0,
-    approvalReviewerThreads: 0,
-    approvalReviewerFreshShare: 0,
-    cacheShare: 0.7,
-    durationMs: 1_000,
-    structural: {
-      patchCalls: 0,
-      toolCalls: 0,
-      postPatchToolCalls: 0,
-      compactCount: 0,
-      taskCompleteCount: 0,
-    },
-    models: [],
-    efforts: [],
-  }, 'fresh', {
+  manager.renderCodex(codexScope(), 'fresh', {
     provider: 'codex',
     observedAt: Date.now() - 60_000,
     source: 'local-log',

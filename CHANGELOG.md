@@ -7,6 +7,12 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
 ## [2.3.3] — Unreleased
 
 ### Fixed
+- **Startup with legacy workspace advice keys (#105)** — a workspace-scoped
+  plaintext BYOK key or unavailable SecretStorage no longer prevents the usage
+  status bar, commands, and dashboard from activating. The old key remains
+  untouched and is never copied into a global secret; AI advice stays
+  unconfigured until the user completes the manual migration. A localized
+  warning no longer blocks extension startup.
 - **Resilient release delivery** — the verified VSIX is attached to the GitHub
   Release before either registry publish begins, and VS Code Marketplace and
   Open VSX are attempted independently. Both registry uploads use pinned,
@@ -18,6 +24,48 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
   replaced by a rebuild.
   Release Drafter also performs a merge-complete reconciliation pass so the PR
   that triggered the main-branch push cannot be omitted by event-ordering races.
+- **Smoother live Webview refreshes** — provider-panel patches now preserve
+  bounded chart, table, project-matrix, heatmap, sharing, preview, and tab-strip
+  horizontal positions with transient privacy-safe structural keys, alongside
+  the existing document identity, focus, selection, and vertical anchor. Local
+  scrolling still performs no per-frame Extension Host persistence.
+- **Stable unchanged Compare refreshes** — the displayed update time now follows
+  the stable rendered data snapshot. An unchanged Compare refresh remains
+  byte-identical and no longer forces a complete Webview document replacement.
+- **Bounded Codex project aggregation** — project previews now index sorted
+  thread rows once instead of rescanning every thread for every project, and
+  last-activity maxima no longer expand history into function arguments.
+- **Single-flight Codex refresh lifecycle** — overlapping poll, watcher, focus,
+  settings, and manual triggers now share one provider lifecycle. A burst keeps
+  only the strongest pending follow-up, all callers await the same bounded
+  drain, diagnostics retain the coalesced-trigger count, and disposal or local
+  data clearing drops queued work instead of starting another index pass.
+  Index teardown also raises a synchronous suspension fence before its first
+  await, so an already queued follow-up cannot recreate the index while a clear
+  or rebuild is active; on success the fence remains until the replacement
+  provider is installed.
+- **Quota status contract** — disabling quota tracking hides both Claude and
+  Codex quota status items while preserving the all-off dashboard entry icon.
+- **Claude calendar rollover** — unchanged histories now republish Today and
+  the rolling 30-day snapshot at configured-timezone midnight without
+  rereading JSONL bodies.
+- **Bounded credentials-watcher recovery** — asynchronous failures from the
+  Claude credentials-directory watcher now use the same capped exponential
+  re-arm path as the provider log watchers while polling remains available. A
+  temporarily absent profile directory no longer breaks that bounded chain,
+  and recovery stops when quota tracking, the window, profile, or extension no
+  longer owns it.
+  Anonymous refresh diagnostics count unnamed quota-watcher events, and Codex
+  index diagnostics now identify their trigger, watcher/debounce counts, and
+  actual backfill/worker mode without paths, filenames, or account data.
+- **Exact bounded Claude content analysis** — the incremental index now preserves
+  the legacy full scan's global tool/Skill attribution, canonical timestamp and
+  discovery ordering, 5,000-Skill boundary, response calibration, and valid
+  JSON-at-EOF behavior. Safe appends replay only touched structural IDs and use
+  direct UUID-owner lookups; unchanged refreshes read zero bodies even when a
+  completed malformed line is present. Re-enabling analysis after a disabled
+  timezone change rebuilds day-sensitive contributions before publication,
+  including across DST boundaries.
 
 ## [2.3.2] — 2026-09-12
 

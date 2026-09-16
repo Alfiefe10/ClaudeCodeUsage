@@ -152,6 +152,9 @@ export class StatusBarManager {
     if (!showContext) {
       this.contextItem.hide();
     }
+    if (!usageLimitTracking) {
+      this.quotaItem.hide();
+    }
     // Re-apply the first item — it may need to become an icon-only entry point.
     this.applyCostVisibility();
     if (this.provider === 'codex' && this.lastCodex) {
@@ -164,17 +167,19 @@ export class StatusBarManager {
   }
 
   /** Show / hide the first status-bar item per the showCost setting. When cost
-   * is off, the item normally hides — UNLESS the quota and context items are
-   * also off by setting, in which case there would be NO clickable way back
-   * into the dashboard. In that all-off case we keep it as an icon-only entry
-   * point. Every method that sets the item's text calls this, so it reappears
-   * (or collapses to the entry icon) as soon as a setting changes. */
+   * is off, the item normally hides — UNLESS quota and context are unavailable
+   * for the selected provider/settings, in which case there would be NO
+   * clickable way back into the dashboard. In that all-off case we keep it as
+   * an icon-only entry point. Every method that sets the item's text calls
+   * this, so it reappears (or collapses to the entry icon) as soon as a setting
+   * changes. */
   private applyCostVisibility(): void {
     if (this.showCost) {
       this.statusBarItem.show();
       return;
     }
-    if (!this.showContext && !this.usageLimitTracking) {
+    const hasContextEntry = this.provider === 'claude' && this.showContext;
+    if (!hasContextEntry && !this.usageLimitTracking) {
       // Sole remaining entry point: an icon that opens the dashboard.
       this.statusBarItem.text = '$(graph)';
       this.statusBarItem.tooltip = I18n.t.popup.title;
@@ -324,6 +329,10 @@ export class StatusBarManager {
     if (this.provider === 'codex') {
       return;
     }
+    if (!this.usageLimitTracking) {
+      this.quotaItem.hide();
+      return;
+    }
     // Normalize first: the API exposes quota windows two ways and only the
     // generic `limits` array still carries the per-model caps. See
     // quotaWindows.ts. liveQuotaWindows then drops or zeroes anything whose
@@ -402,7 +411,12 @@ export class StatusBarManager {
     this.statusBarItem.tooltip = md;
     this.applyCostVisibility();
 
-    if (formatted.limitText && formatted.limit && limit) {
+    if (
+      this.usageLimitTracking &&
+      formatted.limitText &&
+      formatted.limit &&
+      limit
+    ) {
       this.quotaItem.text = `$(dashboard) ${formatted.limitText}`;
       this.quotaItem.tooltip = this.createCodexQuotaTooltip(limit, now);
       this.quotaItem.backgroundColor = this.fillBackground(

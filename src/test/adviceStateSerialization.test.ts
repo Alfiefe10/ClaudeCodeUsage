@@ -113,6 +113,156 @@ async function preparedProvider(storage: AdviceLocalStateStorage, initial: Advic
   return { provider, snapshotId, messages };
 }
 
+test('live dashboard patches expose only host-current sealed preview IDs', async () => {
+  const initial = grantedState(true);
+  const storage = new ControlledStorage(initial);
+  const { provider, snapshotId } = await preparedProvider(storage, initial);
+  provider.currentProvider = 'claude';
+  provider.currentTab = 'content';
+  provider.hourlyDataForRolling30DaysByDay = {};
+
+  const documentHtml = [
+    '<!DOCTYPE html>',
+    '<!-- ccu-live-panel:start --><section>fresh</section><!-- ccu-live-panel:end -->',
+    '<script>const hours = /* ccu-live-hours:start */{}/* ccu-live-hours:end */;</script>',
+  ].join('');
+  const validPatch = provider.dashboardLivePatchFor(documentHtml);
+  assert.ok(validPatch);
+  assert.deepEqual(validPatch.adviceSnapshotIds, { claude: snapshotId });
+
+  provider.adviceConsentWritesPending = 1;
+  const pendingConsentPatch = provider.dashboardLivePatchFor(documentHtml);
+  assert.ok(pendingConsentPatch);
+  assert.deepEqual(pendingConsentPatch.adviceSnapshotIds, {});
+  provider.adviceConsentWritesPending = 0;
+
+  const stored = provider.preparedAdviceSnapshots.get(snapshotId);
+  assert.ok(stored);
+  const duplicateSnapshotId = 'snapshot-111111111111111111111111';
+  provider.preparedAdviceSnapshots.set(duplicateSnapshotId, stored);
+  const ambiguousPatch = provider.dashboardLivePatchFor(documentHtml);
+  assert.ok(ambiguousPatch);
+  assert.deepEqual(ambiguousPatch.adviceSnapshotIds, {});
+  provider.preparedAdviceSnapshots.delete(duplicateSnapshotId);
+
+  const originalState = provider.adviceEffectivenessStates.claude;
+  assert.ok(originalState);
+  provider.adviceEffectivenessStates = {
+    claude: {
+      ...originalState,
+      contract: {
+        ...originalState.contract,
+        observations: originalState.contract.observations.map((observation: any, index: number) =>
+          index === 0 ? { ...observation, value: Number(observation.value) + 1 } : observation),
+      },
+    },
+  };
+  const changedSourcePatch = provider.dashboardLivePatchFor(documentHtml);
+  assert.ok(changedSourcePatch);
+  assert.deepEqual(changedSourcePatch.adviceSnapshotIds, {});
+  provider.adviceEffectivenessStates = { claude: originalState };
+
+  provider.adviceConsentGeneration += 1;
+  const stalePatch = provider.dashboardLivePatchFor(documentHtml);
+  assert.ok(stalePatch);
+  assert.deepEqual(stalePatch.adviceSnapshotIds, {});
+});
+
+test('prompt sample boundaries cannot collide in the sealed source revision', async () => {
+  const initial = grantedState(true);
+  const storage = new ControlledStorage(initial);
+  const { provider, messages } = await preparedProvider(storage, initial);
+  provider.currentProvider = 'claude';
+  provider.currentTab = 'content';
+  provider.hourlyDataForRolling30DaysByDay = {};
+
+  const providerState = provider.adviceEffectivenessStates.claude;
+  providerState.promptSamples = [{ text: 'alpha\u0000beta' }, { text: 'gamma' }];
+  provider.handlePrepareAdviceSnapshotMessage({
+    provider: 'claude', aggregateConsent: 'explicit', promptSampleConsent: 'explicit',
+  });
+  const snapshotId = [...provider.preparedAdviceSnapshots.keys()][0];
+  assert.ok(snapshotId);
+
+  // The concatenated bytes are identical if sample boundaries are represented
+  // by a NUL delimiter, while the sealed JSON payloads are different.
+  providerState.promptSamples = [{ text: 'alpha' }, { text: 'beta\u0000gamma' }];
+  const documentHtml = [
+    '<!DOCTYPE html>',
+    '<!-- ccu-live-panel:start --><section>fresh</section><!-- ccu-live-panel:end -->',
+    '<script>const hours = /* ccu-live-hours:start */{}/* ccu-live-hours:end */;</script>',
+  ].join('');
+  const patch = provider.dashboardLivePatchFor(documentHtml);
+  assert.ok(patch);
+  assert.deepEqual(patch.adviceSnapshotIds, {}, 'the old payload must not remain restorable');
+
+  let sends = 0;
+  provider.onSendAdviceInvocation = async () => {
+    sends += 1;
+    return { ok: false, code: 'transport-error' };
+  };
+  messages.length = 0;
+  await provider.handleSendAdviceSnapshotMessage({ provider: 'claude', snapshotId });
+  assert.equal(sends, 0, 'the old payload must not remain sendable');
+  assert.equal(messages[messages.length - 1]?.reason, 'stale-preview');
+});
+
+test('arbitrary user-context strings cannot collide in the sealed source revision', async () => {
+  const initial = grantedState(true);
+  const storage = new ControlledStorage(initial);
+  const { provider, messages } = await preparedProvider(storage, initial);
+  provider.currentProvider = 'claude';
+  provider.currentTab = 'content';
+  provider.hourlyDataForRolling30DaysByDay = {};
+
+  const providerState = provider.adviceEffectivenessStates.claude;
+  providerState.userContext = '\uD800';
+  provider.preparedAdviceSnapshots.clear();
+  provider.handlePrepareAdviceSnapshotMessage({
+    provider: 'claude', aggregateConsent: 'explicit', promptSampleConsent: 'explicit',
+  });
+  const surrogateSnapshotId = [...provider.preparedAdviceSnapshots.keys()][0];
+  assert.ok(surrogateSnapshotId);
+
+  // TextEncoder replaces a lone surrogate with U+FFFD, so hashing the raw
+  // string bytes alone collides even though the canonical request JSON differs.
+  providerState.userContext = '\uFFFD';
+  const documentHtml = [
+    '<!DOCTYPE html>',
+    '<!-- ccu-live-panel:start --><section>fresh</section><!-- ccu-live-panel:end -->',
+    '<script>const hours = /* ccu-live-hours:start */{}/* ccu-live-hours:end */;</script>',
+  ].join('');
+  const patch = provider.dashboardLivePatchFor(documentHtml);
+  assert.ok(patch);
+  assert.deepEqual(patch.adviceSnapshotIds, {}, 'the old context must not remain restorable');
+
+  let sends = 0;
+  provider.onSendAdviceInvocation = async () => {
+    sends += 1;
+    return { ok: false, code: 'transport-error' };
+  };
+  messages.length = 0;
+  await provider.handleSendAdviceSnapshotMessage({
+    provider: 'claude', snapshotId: surrogateSnapshotId,
+  });
+  assert.equal(sends, 0, 'the old context must not remain sendable');
+  assert.equal(messages[messages.length - 1]?.reason, 'stale-preview');
+});
+
+test('host clear invalidates browser previews before durable storage settles', async () => {
+  const initial = grantedState();
+  const storage = new ControlledStorage(initial);
+  const { provider, messages } = await preparedProvider(storage, initial);
+
+  messages.length = 0;
+  const clear = provider.clearAdviceLocalData();
+  assert.deepEqual(messages[0], { command: 'advicePreviewsInvalidated' });
+  await nextTurn();
+  assert.equal(storage.pending.length, 1);
+  storage.releaseNext();
+  await clear;
+});
+
 test('withdrawal rejects an old preview before its durable consent write completes', async () => {
   const initial = grantedState();
   const storage = new ControlledStorage(initial);

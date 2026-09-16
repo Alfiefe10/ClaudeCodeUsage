@@ -1207,9 +1207,9 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsIntro:
         'Settings live here now. Language and data directories remain in VS Code Settings; API keys use VS Code SecretStorage and never sync. Changes apply immediately.',
       secretMigrationFailed:
-        'Claude Code Usage could not move the saved advice API key into encrypted SecretStorage. The extension stopped before deleting the old value. Fix the legacy setting and reload the window.',
+        'The saved advice API key could not be moved into SecretStorage. Usage remains available and the old key was not deleted, but AI advice is unconfigured. Fix the legacy setting and reload the window.',
       secretMigrationWorkspace:
-        'A workspace-specific advice API key cannot be migrated safely into one global SecretStorage entry. Copy it, remove it from workspace settings, reload, then enter it under Dashboard Settings → Advice.',
+        'A workspace-specific advice API key cannot be migrated safely into one global SecretStorage entry. Usage remains available, but AI advice is unconfigured. Copy the key, remove it from workspace settings, reload, then enter it under Dashboard Settings → Advice.',
       settingsResetAll: 'Reset all to defaults',
       settingsGroupGeneral: 'General',
       settingsGroupProviders: 'Providers',
@@ -1508,9 +1508,9 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsIntro:
         "Die Einstellungen sind jetzt hier. Sprache und Datenverzeichnisse bleiben in den VS-Code-Einstellungen; API-Schlüssel liegen in VS Code SecretStorage und werden nie synchronisiert. Änderungen wirken sofort.",
       secretMigrationFailed:
-        'Der gespeicherte API-Schlüssel konnte nicht in den verschlüsselten SecretStorage verschoben werden. Die Erweiterung wurde beendet, bevor der alte Wert gelöscht wurde. Korrigieren Sie die alte Einstellung und laden Sie das Fenster neu.',
+        'Der gespeicherte API-Schlüssel konnte nicht in SecretStorage verschoben werden. Die Nutzungsanzeige bleibt verfügbar und der alte Schlüssel wurde nicht gelöscht, aber die KI-Beratung ist nicht konfiguriert. Korrigieren Sie die alte Einstellung und laden Sie das Fenster neu.',
       secretMigrationWorkspace:
-        'Ein arbeitsbereichsspezifischer API-Schlüssel kann nicht sicher in einen globalen SecretStorage-Eintrag migriert werden. Kopieren und entfernen Sie ihn aus den Arbeitsbereichseinstellungen, laden Sie neu und geben Sie ihn unter Dashboard-Einstellungen → Beratung ein.',
+        'Ein arbeitsbereichsspezifischer API-Schlüssel kann nicht sicher in einen globalen SecretStorage-Eintrag migriert werden. Die Nutzungsanzeige bleibt verfügbar, aber die KI-Beratung ist nicht konfiguriert. Kopieren und entfernen Sie den Schlüssel aus den Arbeitsbereichseinstellungen, laden Sie neu und geben Sie ihn unter Dashboard-Einstellungen → Beratung ein.',
       settingsResetAll: "Alle zurücksetzen",
       settingsGroupGeneral: "Allgemein",
       settingsGroupProviders: "Anbieter",
@@ -1812,9 +1812,9 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsIntro:
         '設定現在都在這裡。語言與資料目錄仍使用 VS Code 設定；API 金鑰存於 VS Code SecretStorage，絕不同步。變更會立即生效。',
       secretMigrationFailed:
-        '無法將已儲存的建議 API 金鑰移入加密 SecretStorage。擴充套件已在刪除舊值前停止。請修正舊設定並重新載入視窗。',
+        '無法將已儲存的建議 API 金鑰移入 SecretStorage。用量功能仍可使用，舊金鑰也未刪除，但 AI 建議尚未設定。請修正舊設定並重新載入視窗。',
       secretMigrationWorkspace:
-        '工作區專用 API 金鑰無法安全遷移至單一全域 SecretStorage。請先複製並從工作區設定移除，重新載入後在「儀表板設定 → 建議」輸入。',
+        '工作區專用 API 金鑰無法安全遷移至單一全域 SecretStorage。用量功能仍可使用，但 AI 建議尚未設定。請先複製金鑰並從工作區設定移除，重新載入後在「儀表板設定 → 建議」輸入。',
       settingsResetAll: '全部還原為預設',
       settingsGroupGeneral: '一般',
       settingsGroupProviders: '供應商',
@@ -2109,9 +2109,9 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsIntro:
         '设置现在都在这里。语言和数据目录仍使用 VS Code 设置；API 密钥存入 VS Code SecretStorage，绝不同步。更改即时生效。',
       secretMigrationFailed:
-        '无法把已保存的建议 API 密钥迁入加密 SecretStorage。插件已在删除旧值前停止。请修正旧设置并重新加载窗口。',
+        '无法把已保存的建议 API 密钥迁入 SecretStorage。用量功能仍可使用，旧密钥也未删除，但 AI 建议尚未配置。请修正旧设置并重新加载窗口。',
       secretMigrationWorkspace:
-        '工作区专用 API 密钥无法安全迁移到单一全局 SecretStorage。请先复制并从工作区设置中移除，重新加载后在“仪表板设置 → 建议”中输入。',
+        '工作区专用 API 密钥无法安全迁移到单一全局 SecretStorage。用量功能仍可使用，但 AI 建议尚未配置。请先复制密钥并从工作区设置中移除，重新加载后在“仪表板设置 → 建议”中输入。',
       settingsResetAll: '全部恢复默认',
       settingsGroupGeneral: '常规',
       settingsGroupProviders: '供应商',
@@ -2406,9 +2406,9 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsIntro:
         '設定はここにまとまりました。言語とデータディレクトリは VS Code 設定を使い、API キーは同期されない VS Code SecretStorage に保存されます。変更は即時反映されます。',
       secretMigrationFailed:
-        '保存済みのアドバイス API キーを暗号化された SecretStorage に移動できませんでした。旧値を削除する前に拡張機能を停止しました。旧設定を修正してウィンドウを再読み込みしてください。',
+        '保存済みのアドバイス API キーを SecretStorage に移動できませんでした。使用量表示は利用でき、旧キーも削除されていませんが、AI アドバイスは未設定です。旧設定を修正してウィンドウを再読み込みしてください。',
       secretMigrationWorkspace:
-        'ワークスペース固有の API キーを単一のグローバル SecretStorage に安全に移行できません。キーをコピーしてワークスペース設定から削除し、再読み込み後に「ダッシュボード設定 → アドバイス」で入力してください。',
+        'ワークスペース固有の API キーを単一のグローバル SecretStorage に安全に移行できません。使用量表示は利用できますが、AI アドバイスは未設定です。キーをコピーしてワークスペース設定から削除し、再読み込み後に「ダッシュボード設定 → アドバイス」で入力してください。',
       settingsResetAll: 'すべて既定値に戻す',
       settingsGroupGeneral: '一般',
       settingsGroupProviders: 'プロバイダー',
@@ -2708,9 +2708,9 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsIntro:
         '설정이 이제 여기로 모였습니다. 언어와 데이터 디렉터리는 VS Code 설정을 사용하고, API 키는 동기화되지 않는 VS Code SecretStorage에 저장됩니다. 변경은 즉시 적용됩니다.',
       secretMigrationFailed:
-        '저장된 조언 API 키를 암호화된 SecretStorage로 옮기지 못했습니다. 이전 값을 삭제하기 전에 확장이 중지되었습니다. 기존 설정을 수정하고 창을 다시 로드하세요.',
+        '저장된 조언 API 키를 SecretStorage로 옮기지 못했습니다. 사용량 기능은 계속 사용할 수 있고 기존 키도 삭제되지 않았지만 AI 조언은 설정되지 않았습니다. 기존 설정을 수정하고 창을 다시 로드하세요.',
       secretMigrationWorkspace:
-        '작업 영역별 API 키는 하나의 전역 SecretStorage 항목으로 안전하게 이전할 수 없습니다. 키를 복사한 뒤 작업 영역 설정에서 제거하고, 다시 로드한 후 대시보드 설정 → 조언에 입력하세요.',
+        '작업 영역별 API 키는 하나의 전역 SecretStorage 항목으로 안전하게 이전할 수 없습니다. 사용량 기능은 계속 사용할 수 있지만 AI 조언은 설정되지 않았습니다. 키를 복사해 작업 영역 설정에서 제거하고, 다시 로드한 후 대시보드 설정 → 조언에 입력하세요.',
       settingsResetAll: '모두 기본값으로',
       settingsGroupGeneral: '일반',
       settingsGroupProviders: '공급자',
@@ -3010,9 +3010,9 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsIntro:
         'As configurações agora ficam aqui. Idioma e diretórios de dados continuam nas Configurações do VS Code; chaves de API ficam no VS Code SecretStorage e nunca são sincronizadas. As alterações são aplicadas imediatamente.',
       secretMigrationFailed:
-        'Não foi possível mover a chave de API de conselho salva para o SecretStorage criptografado. A extensão parou antes de excluir o valor antigo. Corrija a configuração legada e recarregue a janela.',
+        'Não foi possível mover a chave de API de conselho salva para o SecretStorage. O uso continua disponível e a chave antiga não foi excluída, mas o conselho de IA não está configurado. Corrija a configuração antiga e recarregue a janela.',
       secretMigrationWorkspace:
-        'Uma chave de API específica do espaço de trabalho não pode ser migrada com segurança para uma única entrada global do SecretStorage. Copie-a, remova-a das configurações do espaço de trabalho, recarregue e informe-a em Configurações do painel → Conselho.',
+        'Uma chave de API específica do espaço de trabalho não pode ser migrada com segurança para uma única entrada global do SecretStorage. O uso continua disponível, mas o conselho de IA não está configurado. Copie a chave, remova-a das configurações do espaço de trabalho, recarregue e informe-a em Configurações do painel → Conselho.',
       settingsResetAll: 'Restaurar tudo para os padrões',
       settingsGroupGeneral: 'Geral',
       settingsGroupProviders: 'Provedores',
@@ -3311,9 +3311,9 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsIntro:
         'Pengaturan sekarang ada di sini. Bahasa dan direktori data tetap memakai Pengaturan VS Code; API key disimpan di VS Code SecretStorage dan tidak pernah disinkronkan. Perubahan langsung diterapkan.',
       secretMigrationFailed:
-        'API key saran yang tersimpan tidak dapat dipindahkan ke SecretStorage terenkripsi. Ekstensi dihentikan sebelum nilai lama dihapus. Perbaiki pengaturan lama lalu muat ulang jendela.',
+        'API key saran yang tersimpan tidak dapat dipindahkan ke SecretStorage. Fitur penggunaan tetap tersedia dan key lama tidak dihapus, tetapi saran AI belum dikonfigurasi. Perbaiki pengaturan lama lalu muat ulang jendela.',
       secretMigrationWorkspace:
-        'API key khusus workspace tidak dapat dimigrasikan dengan aman ke satu entri SecretStorage global. Salin lalu hapus dari pengaturan workspace, muat ulang, kemudian masukkan di Pengaturan Dashboard → Saran.',
+        'API key khusus workspace tidak dapat dimigrasikan dengan aman ke satu entri SecretStorage global. Fitur penggunaan tetap tersedia, tetapi saran AI belum dikonfigurasi. Salin key, hapus dari pengaturan workspace, muat ulang, kemudian masukkan di Pengaturan Dashboard → Saran.',
       settingsResetAll: 'Kembalikan semua ke default',
       settingsGroupGeneral: 'Umum',
       settingsGroupProviders: 'Penyedia',

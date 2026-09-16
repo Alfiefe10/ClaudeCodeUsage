@@ -23,6 +23,7 @@ import {
   createEmptyQuotaObservationStore,
   mergeQuotaCaptures,
 } from '../quotaObservationStore';
+import { I18n } from '../i18n';
 
 type ExtensionModule = typeof import('../extension');
 
@@ -75,6 +76,13 @@ function bareExtension(): any {
   extension.fileWatcherGeneration = 0;
   extension.codexWatcherGeneration = 0;
   extension.credentialsWatcherGeneration = 0;
+  extension.credentialsWatcherMissingFilenameEventsSinceRefresh = 0;
+  extension.codexWatcherEventsSinceRefresh = 0;
+  extension.codexCoalescedTriggersSinceRefresh = 0;
+  extension.codexRefreshGate = new RefreshSingleFlight();
+  extension.codexRefreshDrain = null;
+  extension.codexRefreshSuspensionDepth = 0;
+  extension.codexWatchDebouncePending = false;
   extension.disposed = false;
   extension.codexBackgroundState = createBackgroundWorkState({
     measurementVersion: 1,
@@ -106,6 +114,36 @@ function bareExtension(): any {
     updateWeeklyQuotaHistory: () => undefined,
   };
   return extension;
+}
+
+function installManualTimers(): {
+  scheduled: Array<{ id: number; callback: () => void; delayMs: number }>;
+  cleared: number[];
+  restore: () => void;
+} {
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const scheduled: Array<{ id: number; callback: () => void; delayMs: number }> = [];
+  const cleared: number[] = [];
+  let nextId = 0;
+
+  globalThis.setTimeout = ((callback: () => void, milliseconds?: number) => {
+    nextId += 1;
+    scheduled.push({ id: nextId, callback, delayMs: milliseconds ?? 0 });
+    return nextId as unknown as NodeJS.Timeout;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((timer: NodeJS.Timeout) => {
+    cleared.push(timer as unknown as number);
+  }) as typeof clearTimeout;
+
+  return {
+    scheduled,
+    cleared,
+    restore: () => {
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.clearTimeout = originalClearTimeout;
+    },
+  };
 }
 
 test('background transition stops every Claude and Codex recurring resource once', () => {
@@ -436,6 +474,301 @@ test('Codex live index progress coalesces dashboard renders', () => {
   } finally {
     Date.now = originalNow;
   }
+});
+
+test('overlapping Codex refresh triggers enter the provider lifecycle once with one strongest follow-up', async () => {
+  const extension = bareExtension();
+  const started: string[] = [];
+  const coalescedCounts: number[] = [];
+  let active = 0;
+  let maxActive = 0;
+  let release!: () => void;
+  const blocker = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  extension.codexRefreshGate = new RefreshSingleFlight();
+  extension.codexCoalescedTriggersSinceRefresh = 0;
+  extension.waitForCodexProviderRetirements = async () => undefined;
+  extension.runCodexRefresh = async (
+    trigger: string,
+    diagnosticContext: { coalescedTriggers: number },
+  ) => {
+    started.push(trigger);
+    coalescedCounts.push(diagnosticContext.coalescedTriggers);
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await blocker;
+    active -= 1;
+  };
+
+  const requests = [
+    extension.refreshCodexData('poll'),
+    extension.refreshCodexData('watch'),
+    extension.refreshCodexData('focus'),
+    extension.refreshCodexData('manual'),
+  ];
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(started, ['poll']);
+  assert.equal(maxActive, 1);
+
+  release();
+  await Promise.all(requests);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(started, ['poll', 'manual']);
+  assert.equal(
+    coalescedCounts.reduce((total, count) => total + count, 0),
+    3,
+  );
+  assert.equal(extension.codexCoalescedTriggersSinceRefresh, 0);
+  assert.equal(maxActive, 1);
+  assert.equal(extension.activeCodexRefreshes.size, 0);
+});
+
+test('Codex refresh single-flight releases the gate after an unexpected scheduler failure', async () => {
+  const extension = bareExtension();
+  const started: string[] = [];
+  let fail = true;
+  extension.runScheduledCodexRefresh = async (trigger: string) => {
+    started.push(trigger);
+    if (fail) {
+      fail = false;
+      throw new Error('scheduler failed');
+    }
+  };
+
+  await assert.rejects(
+    extension.refreshCodexData('poll'),
+    /scheduler failed/,
+  );
+  await extension.refreshCodexData('manual');
+
+  assert.deepEqual(started, ['poll', 'manual']);
+  assert.equal(extension.codexRefreshDrain, null);
+});
+
+test('Codex refresh single-flight drops a queued follow-up after disposal begins', async () => {
+  const extension = bareExtension();
+  const started: string[] = [];
+  let release!: () => void;
+  const blocker = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  extension.runScheduledCodexRefresh = async (trigger: string) => {
+    started.push(trigger);
+    await blocker;
+  };
+
+  const first = extension.refreshCodexData('poll');
+  const queued = extension.refreshCodexData('manual');
+  await new Promise((resolve) => setImmediate(resolve));
+  extension.disposed = true;
+  release();
+  await Promise.all([first, queued]);
+  await extension.refreshCodexData('focus');
+
+  assert.deepEqual(started, ['poll']);
+  assert.equal(extension.codexRefreshDrain, null);
+});
+
+test('Codex refresh single-flight drops a queued follow-up across index teardown', async () => {
+  const extension = bareExtension();
+  const started: string[] = [];
+  let release!: () => void;
+  const blocker = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  extension.codexRefreshSuspensionDepth = 0;
+  extension.runScheduledCodexRefresh = async (trigger: string) => {
+    started.push(trigger);
+    if (started.length === 1) await blocker;
+  };
+
+  const first = extension.refreshCodexData('poll');
+  const queued = extension.refreshCodexData('manual');
+  await new Promise((resolve) => setImmediate(resolve));
+  extension.codexRefreshSuspensionDepth += 1;
+  release();
+  await Promise.all([first, queued]);
+
+  assert.deepEqual(started, ['poll']);
+  extension.codexRefreshSuspensionDepth -= 1;
+  await extension.refreshCodexData('manual');
+  assert.deepEqual(started, ['poll', 'manual']);
+  assert.equal(extension.codexRefreshDrain, null);
+});
+
+test('Codex refresh parked on provider retirement stops when local data clearing begins', async () => {
+  const extension = bareExtension();
+  let finishRetirement!: () => void;
+  const retirement = new Promise<void>((resolve) => {
+    finishRetirement = resolve;
+  });
+  let providerRuns = 0;
+  extension.waitForCodexProviderRetirements = async () => {
+    await retirement;
+  };
+  extension.runCodexRefresh = async () => {
+    providerRuns += 1;
+  };
+
+  const refresh = extension.refreshCodexData('poll');
+  await new Promise((resolve) => setImmediate(resolve));
+  extension.localDataClearedRequiresReload = true;
+  finishRetirement();
+  await refresh;
+
+  assert.equal(providerRuns, 0);
+  assert.equal(extension.codexRefreshDrain, null);
+});
+
+test('Codex refresh parked on provider retirement stops when index teardown begins', async () => {
+  const extension = bareExtension();
+  let finishRetirement!: () => void;
+  const retirement = new Promise<void>((resolve) => {
+    finishRetirement = resolve;
+  });
+  let providerRuns = 0;
+  extension.waitForCodexProviderRetirements = async () => {
+    await retirement;
+  };
+  extension.runCodexRefresh = async () => {
+    providerRuns += 1;
+  };
+
+  const refresh = extension.refreshCodexData('poll');
+  await new Promise((resolve) => setImmediate(resolve));
+  extension.codexRefreshSuspensionDepth += 1;
+  finishRetirement();
+  await refresh;
+  extension.codexRefreshSuspensionDepth -= 1;
+
+  assert.equal(providerRuns, 0);
+  assert.equal(extension.codexRefreshDrain, null);
+});
+
+test('Codex index teardown and the real refresh drain cannot revive a queued follow-up', async () => {
+  const extension = bareExtension();
+  const started: string[] = [];
+  let releaseRefresh!: () => void;
+  const refreshBlocker = new Promise<void>((resolve) => {
+    releaseRefresh = resolve;
+  });
+  extension.runCodexRefresh = async (trigger: string) => {
+    started.push(trigger);
+    if (started.length === 1) await refreshBlocker;
+  };
+  extension.waitForCodexProviderRetirements = async () => undefined;
+  extension.stopCodexWatching = () => undefined;
+  extension.cancelCodexProviderAndWait = async () => undefined;
+  extension.releaseCodexOwnership = async () => undefined;
+  extension.context.globalStorageUri = { fsPath: '/fixture/storage' };
+  extension.removeDerivedFileFamilyWithLease = async () => undefined;
+  extension.saveCodexBackgroundState = async () => undefined;
+  extension.getConfiguration = () => ({ codexEnabled: true });
+  extension.createCodexProvider = () => ({ dispose: async () => undefined });
+  extension.syncProviderUi = () => undefined;
+  extension.codexProvider = { dispose: async () => undefined };
+
+  const first = extension.refreshCodexData('poll');
+  await new Promise((resolve) => setImmediate(resolve));
+  const queued = extension.refreshCodexData('manual');
+  const clearing = extension.clearCodexDerivedIndex(false);
+  assert.equal(extension.codexRefreshSuspensionDepth, 1);
+  releaseRefresh();
+  await Promise.all([first, queued, clearing]);
+
+  assert.deepEqual(started, ['poll']);
+  assert.equal(extension.codexRefreshSuspensionDepth, 0);
+  assert.equal(extension.codexRefreshDrain, null);
+  await extension.refreshCodexData('manual');
+  assert.deepEqual(started, ['poll', 'manual']);
+});
+
+test('Codex index rebuild suspends refreshes until the replacement provider is installed', async () => {
+  const extension = bareExtension();
+  const calls: string[] = [];
+  let finishRetirement!: () => void;
+  const retirement = new Promise<void>((resolve) => {
+    finishRetirement = resolve;
+  });
+  const retiring = {
+    dispose: async () => {
+      calls.push(`dispose:${extension.codexRefreshSuspensionDepth}`);
+    },
+  };
+  extension.codexProvider = retiring;
+  extension.windowActivity = new WindowActivityGate(true);
+  extension.stopCodexWatching = () => {
+    calls.push(`stop:${extension.codexRefreshSuspensionDepth}`);
+  };
+  extension.waitForCodexProviderRetirements = async () => {
+    calls.push(`retire:${extension.codexRefreshSuspensionDepth}`);
+    await retirement;
+  };
+  extension.cancelCodexProviderAndWait = async () => {
+    calls.push(`cancel:${extension.codexRefreshSuspensionDepth}`);
+  };
+  extension.releaseCodexOwnership = async () => {
+    calls.push(`release:${extension.codexRefreshSuspensionDepth}`);
+  };
+  extension.context.globalStorageUri = { fsPath: '/fixture/storage' };
+  extension.removeDerivedFileFamilyWithLease = async () => {
+    calls.push(`remove:${extension.codexRefreshSuspensionDepth}`);
+  };
+  extension.saveCodexBackgroundState = async () => {
+    calls.push(`save:${extension.codexRefreshSuspensionDepth}`);
+  };
+  extension.createCodexProvider = () => {
+    calls.push(`replace:${extension.codexRefreshSuspensionDepth}`);
+    return { dispose: async () => undefined };
+  };
+  extension.syncProviderUi = () => {
+    calls.push(`sync:${extension.codexRefreshSuspensionDepth}`);
+  };
+  extension.getConfiguration = () => ({ codexEnabled: true });
+  extension.refreshCodexData = async (trigger: string) => {
+    calls.push(`refresh:${trigger}:${extension.codexRefreshSuspensionDepth}`);
+  };
+  extension.startCodexWatching = () => {
+    calls.push(`start:${extension.codexRefreshSuspensionDepth}`);
+  };
+
+  const clearing = extension.clearCodexDerivedIndex(true);
+  assert.equal(extension.codexRefreshSuspensionDepth, 1);
+  finishRetirement();
+  await clearing;
+
+  assert.deepEqual(calls, [
+    'stop:1',
+    'retire:1',
+    'cancel:1',
+    'dispose:1',
+    'release:1',
+    'remove:1',
+    'save:1',
+    'replace:1',
+    'sync:1',
+    'refresh:manual:0',
+    'start:0',
+  ]);
+  assert.equal(extension.codexRefreshSuspensionDepth, 0);
+});
+
+test('Codex index teardown releases refresh suspension after a lifecycle failure', async () => {
+  const extension = bareExtension();
+  extension.stopCodexWatching = () => undefined;
+  extension.waitForCodexProviderRetirements = async () => {
+    throw new Error('retirement failed');
+  };
+
+  await assert.rejects(
+    extension.clearCodexDerivedIndex(false),
+    /retirement failed/,
+  );
+
+  assert.equal(extension.codexRefreshSuspensionDepth, 0);
 });
 
 test('cooldown, user pause, and completed measurement suppress historical backfill', async () => {
@@ -1445,6 +1778,553 @@ test('Codex watcher errors close the whole set and recover with bounded backoff'
     globalThis.clearTimeout = originalClearTimeout;
     fs.rmSync(codexHome, { recursive: true, force: true });
   }
+});
+
+test('unchanged Claude history republishes Today and rolling 30 days at configured-zone midnight', async () => {
+  const extension = bareExtension();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ccu-claude-midnight-'));
+  const project = path.join(root, 'projects', '-fixture');
+  fs.mkdirSync(project, { recursive: true });
+  const usageLine = (id: string, timestamp: string, input: number): string =>
+    JSON.stringify({
+      type: 'assistant',
+      timestamp,
+      cwd: '/fixture/project',
+      gitBranch: 'main',
+      requestId: `request-${id}`,
+      message: {
+        id: `message-${id}`,
+        model: 'claude-sonnet-4-5',
+        content: [{ type: 'text', text: `answer-${id}` }],
+        usage: {
+          input_tokens: input,
+          output_tokens: 1,
+          cache_creation_input_tokens: 2,
+          cache_read_input_tokens: 3,
+        },
+      },
+    });
+  fs.writeFileSync(
+    path.join(project, 'session-root.jsonl'),
+    [
+      usageLine('rolling-boundary', '2030-02-09T04:00:00.000Z', 100),
+      usageLine('today', '2030-03-10T15:30:00.000Z', 10),
+    ].join('\n') + '\n',
+    'utf8',
+  );
+
+  const originalNow = Date.now;
+  const originalTimeZone = I18n.getTimezone();
+  let now = Date.parse('2030-03-10T15:59:30.000Z');
+  Date.now = () => now;
+  I18n.setTimezone('Asia/Hong_Kong');
+  extension.localDataClearedRequiresReload = false;
+  extension.refreshGate = new RefreshSingleFlight();
+  extension.quotaColdRetryDone = true;
+  extension.cache = {
+    records: [],
+    contentAnalysis: null,
+    claudeIndex: createClaudeUsageIndex(),
+    manifest: null,
+    lastUpdate: new Date(0),
+    dataDirectory: null,
+    usageLimits: null,
+    usageLimitsLastUpdate: new Date(0),
+    usageLimitsBackoffUntil: new Date(0),
+    usageLimitsFailStreak: 0,
+  };
+  extension.getConfiguration = () => ({
+    dataDirectory: root,
+    dashboardAutoRefresh: true,
+    enableContentAnalysis: false,
+    advicePromptWindowDays: 30,
+    projectGroupingMode: 'git',
+    contextWindowOverride: 0,
+    timezone: 'Asia/Hong_Kong',
+  });
+  extension.refreshCodexData = () => undefined;
+  extension.maybeFetchUsageLimits = async () => null;
+  extension.syncProviderUi = () => undefined;
+  const diagnostics: string[] = [];
+  extension.outputChannel = { appendLine: (line: string) => diagnostics.push(line) };
+  const statusTodaySnapshots: number[] = [];
+  extension.statusBar = {
+    setLoading: () => undefined,
+    updateQuota: () => undefined,
+    updateContext: () => undefined,
+    updateUsageData: (
+      today: { totalInputTokens?: number } | null,
+      _workspaceToday: unknown,
+      _error: unknown,
+      _limits: unknown,
+      _month: unknown,
+    ) => statusTodaySnapshots.push(today?.totalInputTokens ?? 0),
+  };
+  const dashboardSnapshots: Array<{ today: number; rolling30: number }> = [];
+  extension.webviewProvider = {
+    setLoading: () => undefined,
+    updateQuota: () => undefined,
+    updateData: (
+      _session: unknown,
+      today: { totalInputTokens?: number } | null,
+      rolling30: { totalInputTokens?: number } | null,
+    ) => dashboardSnapshots.push({
+      today: today?.totalInputTokens ?? 0,
+      rolling30: rolling30?.totalInputTokens ?? 0,
+    }),
+  };
+
+  try {
+    await extension.refreshData(true, 'manual');
+    now = Date.parse('2030-03-10T16:00:30.000Z');
+    await extension.refreshData(false, 'poll');
+
+    assert.equal(dashboardSnapshots.length, 2);
+    assert.equal(statusTodaySnapshots.length, 2);
+    assert.deepEqual(dashboardSnapshots, [
+      { today: 10, rolling30: 110 },
+      { today: 0, rolling30: 10 },
+    ]);
+    assert.deepEqual(statusTodaySnapshots, [10, 0]);
+    assert.equal(extension.cache.records.length, 2);
+    assert.match(diagnostics[diagnostics.length - 1], /changed=0/);
+    assert.match(diagnostics[diagnostics.length - 1], /io\(bytes=0 lines=0\)/);
+  } finally {
+    Date.now = originalNow;
+    I18n.setTimezone(originalTimeZone);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('credentials watcher counts unnamed events without exposing filenames', async () => {
+  const extension = bareExtension();
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'ccu-credentials-watch-event-'));
+  const originalWatch = fs.watch;
+  let listener: ((eventType: string, filename: string | Buffer | null) => void) | undefined;
+  let watcherClosed = 0;
+  extension.windowActivity = new WindowActivityGate(true);
+  extension.getConfiguration = () => ({ usageLimitTracking: true });
+  extension.apiClient = {
+    getCredentialsPath: () => path.join(profile, '.credentials.json'),
+  };
+  (fs as any).watch = (
+    directory: string,
+    callback: (eventType: string, filename: string | Buffer | null) => void,
+  ) => {
+    assert.equal(directory, profile);
+    listener = callback;
+    const watcher = {
+      close: () => { watcherClosed += 1; },
+      on: () => watcher,
+    };
+    return watcher;
+  };
+
+  try {
+    extension.startCredentialsWatching();
+    assert.ok(listener);
+    listener('rename', null);
+    listener('change', 'unrelated.json');
+    assert.equal(extension.credentialsWatcherMissingFilenameEventsSinceRefresh, 1);
+  } finally {
+    extension.stopCredentialsWatching();
+    await extension.drainResourceStops();
+    (fs as any).watch = originalWatch;
+    fs.rmSync(profile, { recursive: true, force: true });
+  }
+  assert.equal(watcherClosed, 1);
+});
+
+test('credentials watcher errors reuse bounded recovery and cannot rearm after disposal', async () => {
+  const extension = bareExtension();
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'ccu-credentials-watch-error-'));
+  const originalWatch = fs.watch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const errorListeners: Array<(error: Error) => void> = [];
+  const retryCallbacks: Array<() => void> = [];
+  const retryDelays: number[] = [];
+  const clearedTimers: number[] = [];
+  const diagnostics: string[] = [];
+  let nextTimer = 0;
+  let watchCalls = 0;
+  let watcherClosed = 0;
+
+  extension.windowActivity = new WindowActivityGate(true);
+  extension.getConfiguration = () => ({ usageLimitTracking: true });
+  extension.outputChannel = { appendLine: (line: string) => diagnostics.push(line) };
+  extension.apiClient = {
+    getCredentialsPath: () => path.join(profile, '.credentials.json'),
+  };
+  (fs as any).watch = () => {
+    watchCalls += 1;
+    const watcher = {
+      close: () => { watcherClosed += 1; },
+      on: (event: string, listener: (error: Error) => void) => {
+        if (event === 'error') errorListeners.push(listener);
+        return watcher;
+      },
+    };
+    return watcher;
+  };
+  globalThis.setTimeout = ((callback: () => void, milliseconds?: number) => {
+    retryCallbacks.push(callback);
+    retryDelays.push(milliseconds ?? 0);
+    nextTimer += 1;
+    return nextTimer as unknown as NodeJS.Timeout;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((timer: NodeJS.Timeout) => {
+    clearedTimers.push(timer as unknown as number);
+  }) as typeof clearTimeout;
+
+  try {
+    extension.startCredentialsWatching();
+    assert.equal(watchCalls, 1);
+    assert.equal(errorListeners.length, 1, 'the watcher must handle asynchronous fs.watch errors');
+
+    errorListeners[0](Object.assign(new Error('credentials watch resources exhausted'), { code: 'EMFILE' }));
+    await extension.drainResourceStops();
+    assert.equal(extension.credsWatcher, undefined);
+    assert.equal(watcherClosed, 1);
+    assert.deepEqual(retryDelays, [1_000]);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.timer, 1);
+
+    retryCallbacks[0]();
+    await extension.drainResourceStops();
+    assert.equal(watchCalls, 2, 'the first retry rearms the credentials watcher');
+    assert.equal(errorListeners.length, 2);
+
+    errorListeners[1](Object.assign(new Error('credentials watch resources still exhausted'), { code: 'ENOSPC' }));
+    await extension.drainResourceStops();
+    assert.deepEqual(retryDelays, [1_000, 2_000], 'consecutive failures back off instead of hot-looping');
+
+    const staleRetry = retryCallbacks[1];
+    extension.disposed = true;
+    extension.stopCredentialsWatching('extension-dispose');
+    await extension.drainResourceStops();
+    staleRetry();
+    assert.equal(watchCalls, 2, 'a cancelled disposal retry cannot recreate the watcher');
+    assert.deepEqual(clearedTimers, [2]);
+    assert.equal(extension.resourceOwnership.snapshotForTests().activeCount, 0);
+    assert.match(diagnostics.join('\n'), /Claude credentials/);
+    assert.match(diagnostics.join('\n'), /EMFILE/);
+    assert.match(diagnostics.join('\n'), /ENOSPC/);
+    assert.match(diagnostics.join('\n'), /poll/i);
+    assert.doesNotMatch(diagnostics.join('\n'), new RegExp(profile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  } finally {
+    extension.stopCredentialsWatching();
+    (fs as any).watch = originalWatch;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+    fs.rmSync(profile, { recursive: true, force: true });
+  }
+});
+
+test('credentials watcher recovery keeps one bounded timer across repeated missing-directory retries', async () => {
+  const extension = bareExtension();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ccu-credentials-watch-missing-'));
+  const profile = path.join(root, 'profile');
+  fs.mkdirSync(profile);
+  const originalWatch = fs.watch;
+  const timers = installManualTimers();
+  const errorListeners: Array<(error: Error) => void> = [];
+  const diagnostics: string[] = [];
+  let watchCalls = 0;
+  let watcherClosed = 0;
+
+  extension.windowActivity = new WindowActivityGate(true);
+  extension.getConfiguration = () => ({ usageLimitTracking: true });
+  extension.outputChannel = { appendLine: (line: string) => diagnostics.push(line) };
+  extension.apiClient = {
+    getCredentialsPath: () => path.join(profile, '.credentials.json'),
+  };
+  (fs as any).watch = () => {
+    watchCalls += 1;
+    const watcher = {
+      close: () => { watcherClosed += 1; },
+      on: (event: string, listener: (error: Error) => void) => {
+        if (event === 'error') errorListeners.push(listener);
+        return watcher;
+      },
+    };
+    return watcher;
+  };
+
+  try {
+    extension.startCredentialsWatching();
+    errorListeners[0](Object.assign(new Error('watch failed'), { code: 'EMFILE' }));
+    errorListeners[0](Object.assign(new Error('duplicate stale error'), { code: 'ENOSPC' }));
+    await extension.drainResourceStops();
+    fs.rmSync(profile, { recursive: true, force: true });
+
+    assert.deepEqual(timers.scheduled.map((timer) => timer.delayMs), [1_000]);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.timer, 1);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.watcher, 0);
+
+    timers.scheduled[0].callback();
+    await extension.drainResourceStops();
+    assert.deepEqual(timers.scheduled.map((timer) => timer.delayMs), [1_000, 2_000]);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.timer, 1);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.watcher, 0);
+
+    timers.scheduled[0].callback();
+    timers.scheduled[1].callback();
+    await extension.drainResourceStops();
+    assert.deepEqual(timers.scheduled.map((timer) => timer.delayMs), [1_000, 2_000, 4_000]);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.timer, 1);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.watcher, 0);
+    assert.equal(watchCalls, 1);
+    assert.equal(watcherClosed, 1);
+    assert.doesNotMatch(
+      diagnostics.join('\n'),
+      new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+    );
+  } finally {
+    extension.stopCredentialsWatching();
+    await extension.drainResourceStops();
+    (fs as any).watch = originalWatch;
+    timers.restore();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('credentials watcher recovery restores exactly one watcher after the directory returns', async () => {
+  const extension = bareExtension();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ccu-credentials-watch-return-'));
+  const profile = path.join(root, 'profile');
+  fs.mkdirSync(profile);
+  const originalWatch = fs.watch;
+  const timers = installManualTimers();
+  const errorListeners: Array<(error: Error) => void> = [];
+  let watchCalls = 0;
+  let watcherClosed = 0;
+
+  extension.windowActivity = new WindowActivityGate(true);
+  extension.getConfiguration = () => ({ usageLimitTracking: true });
+  extension.apiClient = {
+    getCredentialsPath: () => path.join(profile, '.credentials.json'),
+  };
+  (fs as any).watch = () => {
+    watchCalls += 1;
+    const watcher = {
+      close: () => { watcherClosed += 1; },
+      on: (event: string, listener: (error: Error) => void) => {
+        if (event === 'error') errorListeners.push(listener);
+        return watcher;
+      },
+    };
+    return watcher;
+  };
+
+  try {
+    extension.startCredentialsWatching();
+    errorListeners[0](Object.assign(new Error('watch failed'), { code: 'EMFILE' }));
+    await extension.drainResourceStops();
+    fs.rmSync(profile, { recursive: true, force: true });
+
+    timers.scheduled[0].callback();
+    await extension.drainResourceStops();
+    fs.mkdirSync(profile);
+    timers.scheduled[1].callback();
+    await extension.drainResourceStops();
+
+    assert.equal(watchCalls, 2);
+    assert.equal(watcherClosed, 1);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.timer, 0);
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.watcher, 1);
+
+    timers.scheduled[0].callback();
+    timers.scheduled[1].callback();
+    await extension.drainResourceStops();
+    assert.equal(watchCalls, 2, 'stale retry callbacks cannot create duplicate watchers');
+    assert.equal(extension.resourceOwnership.snapshotForTests().byKind.watcher, 1);
+  } finally {
+    extension.stopCredentialsWatching();
+    await extension.drainResourceStops();
+    (fs as any).watch = originalWatch;
+    timers.restore();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('credentials watcher recovery stops when quota tracking is disabled before retry', async () => {
+  const extension = bareExtension();
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'ccu-credentials-watch-disabled-'));
+  const originalWatch = fs.watch;
+  const timers = installManualTimers();
+  const errorListeners: Array<(error: Error) => void> = [];
+  let usageLimitTracking = true;
+  let watchCalls = 0;
+
+  extension.windowActivity = new WindowActivityGate(true);
+  extension.getConfiguration = () => ({ usageLimitTracking });
+  extension.apiClient = {
+    getCredentialsPath: () => path.join(profile, '.credentials.json'),
+  };
+  (fs as any).watch = () => {
+    watchCalls += 1;
+    const watcher = {
+      close: () => undefined,
+      on: (event: string, listener: (error: Error) => void) => {
+        if (event === 'error') errorListeners.push(listener);
+        return watcher;
+      },
+    };
+    return watcher;
+  };
+
+  try {
+    extension.startCredentialsWatching();
+    errorListeners[0](Object.assign(new Error('watch failed'), { code: 'EMFILE' }));
+    await extension.drainResourceStops();
+    usageLimitTracking = false;
+
+    timers.scheduled[0].callback();
+    await extension.drainResourceStops();
+    assert.equal(watchCalls, 1);
+    assert.equal(timers.scheduled.length, 1, 'disabled quota tracking cannot schedule another retry');
+    assert.equal(extension.resourceOwnership.snapshotForTests().activeCount, 0);
+  } finally {
+    extension.stopCredentialsWatching();
+    await extension.drainResourceStops();
+    (fs as any).watch = originalWatch;
+    timers.restore();
+    fs.rmSync(profile, { recursive: true, force: true });
+  }
+});
+
+test('credentials watcher recovery callbacks stay cancelled after blur, profile switch, and disposal', async (t) => {
+  for (const scenario of [
+    { name: 'window blur', condition: 'window-blur', deactivate: (extension: any) => extension.windowActivity.update(false) },
+    { name: 'profile switch', condition: 'profile-change', deactivate: () => undefined },
+    { name: 'extension disposal', condition: 'extension-dispose', deactivate: (extension: any) => { extension.disposed = true; } },
+  ] as const) {
+    await t.test(scenario.name, async () => {
+      const extension = bareExtension();
+      const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'ccu-credentials-watch-cancel-'));
+      const originalWatch = fs.watch;
+      const timers = installManualTimers();
+      const errorListeners: Array<(error: Error) => void> = [];
+      let watchCalls = 0;
+
+      extension.windowActivity = new WindowActivityGate(true);
+      extension.getConfiguration = () => ({ usageLimitTracking: true });
+      extension.apiClient = {
+        getCredentialsPath: () => path.join(profile, '.credentials.json'),
+      };
+      (fs as any).watch = () => {
+        watchCalls += 1;
+        const watcher = {
+          close: () => undefined,
+          on: (event: string, listener: (error: Error) => void) => {
+            if (event === 'error') errorListeners.push(listener);
+            return watcher;
+          },
+        };
+        return watcher;
+      };
+
+      try {
+        extension.startCredentialsWatching();
+        errorListeners[0](Object.assign(new Error('watch failed'), { code: 'EMFILE' }));
+        await extension.drainResourceStops();
+        const staleRetry = timers.scheduled[0].callback;
+
+        scenario.deactivate(extension);
+        extension.stopCredentialsWatching(scenario.condition);
+        await extension.drainResourceStops();
+        staleRetry();
+        await extension.drainResourceStops();
+
+        assert.equal(watchCalls, 1);
+        assert.deepEqual(timers.cleared, [1]);
+        assert.equal(extension.resourceOwnership.snapshotForTests().activeCount, 0);
+      } finally {
+        extension.stopCredentialsWatching(
+          scenario.condition === 'extension-dispose' ? 'extension-dispose' : 'settings-change',
+        );
+        await extension.drainResourceStops();
+        (fs as any).watch = originalWatch;
+        timers.restore();
+        fs.rmSync(profile, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test('Codex diagnostics retain trigger, watcher coalescing, backfill, and worker mode', async () => {
+  const extension = bareExtension();
+  const snapshot = snapshotFixture();
+  const diagnostics: string[] = [];
+  extension.codexWatcherEventsSinceRefresh = 7;
+  extension.codexCoalescedTriggersSinceRefresh = 5;
+  extension.getConfiguration = () => ({ codexEnabled: true });
+  extension.windowActivity = new WindowActivityGate(true);
+  extension.outputChannel = { appendLine: (line: string) => diagnostics.push(line) };
+  extension.webviewProvider = { updateCodexProgress: () => undefined };
+  extension.syncProviderUi = () => undefined;
+  extension.codexProvider = {
+    isAvailable: async () => true,
+    loadPersistedSnapshot: async () => snapshot,
+    refresh: async (workerMode: string, _onProgress: unknown, historical: boolean) => {
+      assert.equal(workerMode, 'foreground');
+      assert.equal(historical, true);
+      return {
+        outcome: 'success',
+        snapshot,
+        diagnostic: {
+          bodyReads: 0,
+          failedFiles: 0,
+          metadataMs: 1,
+          parseMs: 2,
+          migrationPending: false,
+        },
+      };
+    },
+  };
+
+  await extension.runCodexRefresh('manual');
+
+  assert.match(
+    diagnostics.join('\n'),
+    /codex-index trigger=manual outcome=success mode\(backfill=historical worker=foreground\) events\(watcher=7 coalesced=5\)/,
+  );
+  assert.equal(extension.codexWatcherEventsSinceRefresh, 0);
+  assert.equal(extension.codexCoalescedTriggersSinceRefresh, 0);
+});
+
+test('Claude refresh diagnostics drain the unnamed quota-watcher event count', async () => {
+  const extension = bareExtension();
+  const originalFind = ClaudeDataLoader.findClaudeDataDirectory;
+  const diagnostics: string[] = [];
+  extension.refreshGate = new RefreshSingleFlight();
+  extension.credentialsWatcherMissingFilenameEventsSinceRefresh = 3;
+  extension.cache = {
+    manifest: null,
+    usageLimits: {},
+  };
+  extension.getConfiguration = () => ({ dashboardAutoRefresh: false });
+  extension.maybeFetchUsageLimits = async () => ({});
+  extension.refreshCodexData = async () => undefined;
+  extension.statusBar = {
+    updateQuota: () => undefined,
+    updateUsageData: () => undefined,
+    updateContext: () => undefined,
+  };
+  extension.webviewProvider = { updateQuota: () => undefined };
+  extension.syncProviderUi = () => undefined;
+  extension.outputChannel = { appendLine: (line: string) => diagnostics.push(line) };
+  (ClaudeDataLoader as any).findClaudeDataDirectory = async () => null;
+
+  try {
+    await extension.refreshData(false, 'credentials');
+  } finally {
+    (ClaudeDataLoader as any).findClaudeDataDirectory = originalFind;
+  }
+
+  assert.match(diagnostics.join('\n'), /refresh: trigger=credentials/);
+  assert.match(diagnostics.join('\n'), /events\(watcher=0 coalesced=0 quota-unnamed=3\)/);
+  assert.equal(extension.credentialsWatcherMissingFilenameEventsSinceRefresh, 0);
 });
 
 test('real Claude filesystem events flow through manifest, index, and dashboard refresh', {

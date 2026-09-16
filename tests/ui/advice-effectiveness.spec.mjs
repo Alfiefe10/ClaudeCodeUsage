@@ -30,6 +30,42 @@ async function dispatchHostMessage(page, message) {
   }, message);
 }
 
+async function dispatchDashboardDataPatch(
+  page,
+  provider,
+  { revision = 1, adviceSnapshotIds = {} } = {},
+) {
+  const url = new URL(page.url());
+  url.searchParams.set('provider', provider);
+  url.searchParams.set('fixture', 'advice-effectiveness');
+  const response = await page.context().request.get(url.toString());
+  const documentText = await response.text();
+  await page.evaluate(({ nextProvider, nextRevision, nextAdviceSnapshotIds, documentText }) => {
+    const activeTab = document.querySelector('.tabs [role="tab"].active')
+      ?.id.replace('tab-', '');
+    if (!activeTab) throw new Error('Current dashboard did not expose an active tab');
+    const nextDocument = new DOMParser().parseFromString(documentText, 'text/html');
+    const nextPanel = nextDocument.getElementById('provider-panel');
+    if (!nextPanel) throw new Error('Fixture did not render a provider panel');
+    window.dispatchEvent(new MessageEvent('message', {
+      data: {
+        command: 'dashboardDataPatch',
+        provider: nextProvider,
+        tab: activeTab,
+        revision: nextRevision,
+        html: nextPanel.innerHTML,
+        claudeLast30HoursByDay: {},
+        adviceSnapshotIds: nextAdviceSnapshotIds,
+      },
+    }));
+  }, {
+    nextProvider: provider,
+    nextRevision: revision,
+    nextAdviceSnapshotIds: adviceSnapshotIds,
+    documentText,
+  });
+}
+
 async function postedMessages(page, command) {
   return page.evaluate((expectedCommand) =>
     window.__ccuPostedMessages.filter((message) => message.command === expectedCommand),
@@ -55,6 +91,28 @@ async function grantAggregateConsent(page) {
     promptSampleConsent: 'not-granted',
   });
   await expect(aggregate).toBeChecked();
+}
+
+async function gateNextAdvicePreviewValidation(page) {
+  await page.evaluate(() => {
+    const original = globalThis.ccuVerifyCanonicalPreview;
+    if (typeof original !== 'function') {
+      throw new Error('Canonical preview verifier is unavailable');
+    }
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    globalThis.__ccuAdvicePreviewValidationStarted = false;
+    globalThis.__ccuReleaseAdvicePreviewValidation = release;
+    globalThis.ccuVerifyCanonicalPreview = async (...args) => {
+      globalThis.__ccuAdvicePreviewValidationStarted = true;
+      await gate;
+      return original(...args);
+    };
+  });
+}
+
+async function releaseAdvicePreviewValidation(page) {
+  await page.evaluate(() => globalThis.__ccuReleaseAdvicePreviewValidation());
 }
 
 async function seriousOrCriticalViolations(page, include) {
@@ -314,6 +372,183 @@ test('sealed preview renders the exact canonical body, UTF-8 size, and SHA-256',
     snapshotId: fixture.snapshotMessages.withPromptSamples.snapshotId,
   });
   expect(networkAfterLoad).toEqual([]);
+});
+
+test('withdrawing consent cancels a preview whose digest validation is pending', async ({ page }) => {
+  const fixture = buildAdviceEffectivenessFixture({ locale: 'en' });
+  await openCandidate(page, 'claude');
+  await grantAggregateConsent(page);
+  await gateNextAdvicePreviewValidation(page);
+
+  const root = page.locator('[data-advice-provider="claude"]');
+  await root.locator('[data-advice-action="preview"]').click();
+  await dispatchHostMessage(page, fixture.snapshotMessages.aggregateOnly);
+  await expect.poll(() => page.evaluate(() =>
+    globalThis.__ccuAdvicePreviewValidationStarted)).toBe(true);
+
+  const aggregate = root.locator('[data-advice-consent-kind="aggregate"]');
+  await aggregate.focus();
+  await aggregate.press('Space');
+  await expectPostedCount(page, 'discardAdviceSnapshot', 2);
+  await releaseAdvicePreviewValidation(page);
+
+  const preview = root.locator('[data-advice-preview]');
+  await expect(aggregate).not.toBeChecked();
+  await expect(preview).toBeHidden();
+  await expect(preview.locator('[data-advice-preview-body]')).toHaveText('');
+  await expect(root.locator('[data-advice-action="send"]')).toBeDisabled();
+});
+
+test('clearing local advice data cancels a preview whose digest validation is pending', async ({ page }) => {
+  const fixture = buildAdviceEffectivenessFixture({ locale: 'en' });
+  await openCandidate(page, 'claude');
+  await grantAggregateConsent(page);
+  await gateNextAdvicePreviewValidation(page);
+
+  const root = page.locator('[data-advice-provider="claude"]');
+  await root.locator('[data-advice-action="preview"]').click();
+  await dispatchHostMessage(page, fixture.snapshotMessages.aggregateOnly);
+  await expect.poll(() => page.evaluate(() =>
+    globalThis.__ccuAdvicePreviewValidationStarted)).toBe(true);
+
+  page.once('dialog', (dialog) => dialog.accept());
+  await root.locator('[data-advice-action="clear"]').click();
+  await expectPostedCount(page, 'clearAdviceLocalData', 1);
+  await releaseAdvicePreviewValidation(page);
+
+  const preview = root.locator('[data-advice-preview]');
+  await expect(preview).toBeHidden();
+  await expect(preview.locator('[data-advice-preview-body]')).toHaveText('');
+  await expect(root.locator('[data-advice-action="send"]')).toBeDisabled();
+});
+
+test('host-triggered advice clear cancels a pending browser digest validation', async ({ page }) => {
+  const fixture = buildAdviceEffectivenessFixture({ locale: 'en' });
+  await openCandidate(page, 'claude');
+  await grantAggregateConsent(page);
+  await gateNextAdvicePreviewValidation(page);
+
+  const root = page.locator('[data-advice-provider="claude"]');
+  await root.locator('[data-advice-action="preview"]').click();
+  await dispatchHostMessage(page, fixture.snapshotMessages.aggregateOnly);
+  await expect.poll(() => page.evaluate(() =>
+    globalThis.__ccuAdvicePreviewValidationStarted)).toBe(true);
+
+  await dispatchHostMessage(page, { command: 'advicePreviewsInvalidated' });
+  await releaseAdvicePreviewValidation(page);
+
+  const preview = root.locator('[data-advice-preview]');
+  await expect(preview).toBeHidden();
+  await expect(preview.locator('[data-advice-preview-body]')).toHaveText('');
+  await expect(root.locator('[data-advice-action="send"]')).toBeDisabled();
+});
+
+test('a live dashboard patch preserves vertical position inside the advice payload preview', async ({ page }) => {
+  const fixture = buildAdviceEffectivenessFixture({ locale: 'en' });
+  const bodyText = JSON.stringify(
+    JSON.parse(fixture.snapshotMessages.aggregateOnly.body),
+    null,
+    2,
+  );
+  const snapshotMessage = {
+    ...fixture.snapshotMessages.aggregateOnly,
+    body: bodyText,
+    utf8Bytes: Buffer.byteLength(bodyText, 'utf8'),
+    sha256: createHash('sha256').update(bodyText, 'utf8').digest('hex'),
+  };
+  await openCandidate(page, 'claude');
+  await page.addStyleTag({
+    content: '.advice-payload-preview pre { max-height: 48px !important; }',
+  });
+  await grantAggregateConsent(page);
+  await page.locator(
+    '[data-advice-provider="claude"] [data-advice-action="preview"]',
+  ).click();
+  await expectPostedCount(page, 'prepareAdviceSnapshot', 1);
+  await dispatchHostMessage(page, snapshotMessage);
+
+  const body = page.locator('[data-advice-preview="claude"] [data-advice-preview-body]');
+  await expect(body).toBeVisible();
+  const before = await body.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+    return {
+      scrollTop: element.scrollTop,
+      maxScrollTop: element.scrollHeight - element.clientHeight,
+    };
+  });
+  expect(before.maxScrollTop).toBeGreaterThan(0);
+  expect(before.scrollTop).toBeGreaterThan(0);
+  const capturedPreview = await page.evaluate(() => {
+    const panel = document.getElementById('provider-panel');
+    return globalThis.ccuCaptureRefreshContext(panel).advicePreviews;
+  });
+  expect(capturedPreview).toHaveLength(1);
+  expect(capturedPreview[0]).toMatchObject({
+    provider: 'claude',
+    snapshotId: snapshotMessage.snapshotId,
+    hidden: false,
+    open: true,
+    body: bodyText,
+  });
+
+  await dispatchDashboardDataPatch(page, 'claude', {
+    adviceSnapshotIds: { claude: snapshotMessage.snapshotId },
+  });
+  await expectPostedCount(page, 'dashboardDataPatchAck', 1);
+  expect((await postedMessages(page, 'dashboardDataPatchAck')).at(-1)).toEqual({
+    command: 'dashboardDataPatchAck',
+    revision: 1,
+    ok: true,
+  });
+
+  const refreshed = page.locator('[data-advice-preview="claude"] [data-advice-preview-body]');
+  await expect(refreshed).toBeVisible();
+  await expect.poll(() => refreshed.evaluate((element) => element.scrollTop))
+    .toBe(before.scrollTop);
+});
+
+test('a live dashboard patch cannot restore a snapshot the host invalidated', async ({ page }) => {
+  const fixture = buildAdviceEffectivenessFixture({ locale: 'en' });
+  await openCandidate(page, 'claude');
+  await grantAggregateConsent(page);
+  await page.locator(
+    '[data-advice-provider="claude"] [data-advice-action="preview"]',
+  ).click();
+  await dispatchHostMessage(page, fixture.snapshotMessages.aggregateOnly);
+
+  const preview = page.locator('[data-advice-preview="claude"]');
+  const body = preview.locator('[data-advice-preview-body]');
+  const send = page.locator(
+    '[data-advice-provider="claude"] [data-advice-action="send"]',
+  );
+  await expect(body).toHaveText(fixture.snapshotMessages.aggregateOnly.body);
+  await expect(send).toBeEnabled();
+
+  const discardedCapture = await page.evaluate(() => {
+    const panel = document.getElementById('provider-panel');
+    const previews = globalThis.ccuCaptureRefreshContext(panel).advicePreviews;
+    globalThis.ccuRestoreAdvicePreviews(previews, {});
+    return previews[0];
+  });
+  expect(discardedCapture).toMatchObject({
+    body: '',
+    digest: '',
+    sendText: '',
+    statusText: '',
+  });
+
+  await page.locator(
+    '[data-advice-provider="claude"] [data-advice-consent-kind="aggregate"]',
+  ).focus();
+  await dispatchDashboardDataPatch(page, 'claude');
+
+  await expect(page.locator(
+    '[data-advice-provider="claude"] [data-advice-consent-kind="aggregate"]',
+  )).not.toBeChecked();
+  await expect(preview).toBeHidden();
+  await expect(body).toHaveText('');
+  await expect(send).toBeDisabled();
+  expect(await postedMessages(page, 'sendAdviceSnapshot')).toEqual([]);
 });
 
 test('candidate exposes only bounded advice actions and feedback posts identifiers plus kind only', async ({ page }) => {

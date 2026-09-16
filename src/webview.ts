@@ -241,6 +241,7 @@ interface DashboardLivePatch {
   panelHtml: string;
   structureKey: string;
   claudeLast30HoursByDay: ReturnType<typeof claudeHourlyDisplayDto>;
+  adviceSnapshotIds: Partial<Record<AdviceEffectivenessProvider, string>>;
 }
 
 interface PendingDashboardLivePatch extends DashboardLivePatch {
@@ -925,6 +926,8 @@ export class UsageWebviewProvider {
   private scheduledDashboardLivePatch: PendingDashboardLivePatch | undefined;
   private dashboardLivePatchSendScheduled = false;
   private lastLivePatchStructureKey: string | undefined;
+  private compareSnapshotRenderKey: string | undefined;
+  private compareSnapshotUpdatedAt = 0;
   private currentSessionData: SessionData | null = null;
   private todayData: UsageData | null = null;
   private rolling30DayData: UsageData | null = null;
@@ -1198,6 +1201,48 @@ export class UsageWebviewProvider {
     }
   }
 
+  /**
+   * Only the extension host can decide whether a sealed preview is still
+   * authorized. The webview receives opaque IDs for the currently valid
+   * previews and must discard any captured DOM content that is not listed.
+   */
+  private activeAdviceSnapshotIds(): Partial<Record<AdviceEffectivenessProvider, string>> {
+    const active: Partial<Record<AdviceEffectivenessProvider, string>> = {};
+    const ambiguous = new Set<AdviceEffectivenessProvider>();
+    if (
+      this.adviceLocalStateStatus !== 'ready' ||
+      this.adviceConsentWritesPending > 0 ||
+      this.adviceLocalState.aggregateConsent !== 'explicit'
+    ) {
+      return active;
+    }
+    for (const [snapshotId, stored] of this.preparedAdviceSnapshots) {
+      const providerState = this.adviceProviderState(stored.provider);
+      if (
+        !providerState ||
+        stored.provider !== providerState.provider ||
+        stored.sourceRevision !== this.adviceSourceRevision(providerState) ||
+        stored.consentGeneration !== this.adviceConsentGeneration ||
+        (stored.snapshot.preview.promptSampleCount > 0 &&
+          this.adviceLocalState.promptSampleConsent !== 'explicit')
+      ) {
+        continue;
+      }
+      // More than one valid snapshot for one provider violates the sealing
+      // invariant. Fail closed instead of choosing one by insertion order.
+      if (ambiguous.has(stored.provider)) {
+        continue;
+      }
+      if (active[stored.provider] !== undefined) {
+        delete active[stored.provider];
+        ambiguous.add(stored.provider);
+        continue;
+      }
+      active[stored.provider] = snapshotId;
+    }
+    return active;
+  }
+
   /** Opaque content revision; no path/session/title is retained or exposed. */
   private adviceSourceRevision(state: AdviceEffectivenessProviderState): string {
     const safeShape = {
@@ -1225,10 +1270,15 @@ export class UsageWebviewProvider {
       // Prompt text remains host-only. Its digest merely invalidates a preview
       // if the separately consented sample set changes before send.
       promptSampleDigest: createHash('sha256')
-        .update(state.promptSamples.map((sample) => sample.text).join('\u0000'), 'utf8')
+        // JSON preserves both array boundaries and embedded control characters.
+        // A delimiter alone is ambiguous because prompt text may contain it.
+        .update(JSON.stringify(state.promptSamples.map((sample) => sample.text)), 'utf8')
         .digest('hex'),
       userContextDigest: createHash('sha256')
-        .update(state.userContext ?? '', 'utf8')
+        // JSON preserves lone surrogates. Hashing the raw UTF-8 bytes would
+        // replace them with U+FFFD and could seal two different request bodies
+        // under the same revision.
+        .update(JSON.stringify(state.userContext ?? ''), 'utf8')
         .digest('hex'),
     };
     return `advice-${createHash('sha256')
@@ -1478,6 +1528,10 @@ export class UsageWebviewProvider {
     if (!storage) {
       return false;
     }
+    // The command-palette path has no browser click that can synchronously
+    // revoke a preview. Cancel browser-side digest validation before the first
+    // durable-storage await, then perform the host-side invalidation below.
+    this.postAdviceMessage({ command: 'advicePreviewsInvalidated' });
     this.adviceLocalStateGeneration += 1;
     this.adviceConsentGeneration += 1;
     this.clearPreparedAdviceSnapshots();
@@ -2690,6 +2744,7 @@ export class UsageWebviewProvider {
       claudeLast30HoursByDay: claudeHourlyDisplayDto(
         this.hourlyDataForRolling30DaysByDay,
       ),
+      adviceSnapshotIds: this.activeAdviceSnapshotIds(),
     };
   }
 
@@ -2729,6 +2784,7 @@ export class UsageWebviewProvider {
         revision: latest.revision,
         html: latest.panelHtml,
         claudeLast30HoursByDay: latest.claudeLast30HoursByDay,
+        adviceSnapshotIds: latest.adviceSnapshotIds,
       })).then((delivered) => {
         if (delivered === false) {
           this.replaceDocumentAfterPatchFailure(latest);
@@ -3021,7 +3077,6 @@ export class UsageWebviewProvider {
 
   private renderCodexCompare(): string {
     const claude = this.allTimeData;
-    const updatedAt = Date.now();
     const formatters = createCodexLocalizedFormatters(
       I18n.getLocale(),
       I18n.getTimezone(),
@@ -3050,11 +3105,7 @@ export class UsageWebviewProvider {
     const sharingWorkspace = this.setting<boolean>('enableShareCard', true)
       ? this.renderCombinedHeatmapPanel()
       : '';
-    return sharingWorkspace +
-      '<section class="usage-summary">' +
-      '<p class="model-details"><strong>' + this.escapeHtml(copy.indexedAllTime) + '</strong> · ' +
-      this.escapeHtml(copy.updatedAt) + ': ' + this.escapeHtml(formatters.formatDateTime(updatedAt)) + '</p>' +
-      '<div class="summary-grid">' +
+    const summaryGrid = '<div class="summary-grid">' +
       card(
         I18n.t.providers.claude,
         copy.claudeTokenAccounting,
@@ -3069,9 +3120,22 @@ export class UsageWebviewProvider {
         codexTotals.cache,
         codexTotals.output,
       ) +
-      '</div></section>' +
-      this.renderWeeklyValuePanel('claude') +
+      '</div>';
+    const weeklyPanels = this.renderWeeklyValuePanel('claude') +
       this.renderWeeklyValuePanel('codex');
+    const renderKey = createHash('sha256')
+      .update(sharingWorkspace + summaryGrid + weeklyPanels, 'utf8')
+      .digest('hex');
+    if (renderKey !== this.compareSnapshotRenderKey) {
+      this.compareSnapshotRenderKey = renderKey;
+      this.compareSnapshotUpdatedAt = Date.now();
+    }
+    return sharingWorkspace +
+      '<section class="usage-summary">' +
+      '<p class="model-details"><strong>' + this.escapeHtml(copy.indexedAllTime) + '</strong> · ' +
+      this.escapeHtml(copy.updatedAt) + ': ' +
+      this.escapeHtml(formatters.formatDateTime(this.compareSnapshotUpdatedAt)) + '</p>' +
+      summaryGrid + '</section>' + weeklyPanels;
   }
 
   private getAlternateProviderContent(): string {
@@ -10836,6 +10900,20 @@ async function ccuVerifyCanonicalPreview(body, sha256, utf8Bytes) {
 }
 var advicePreviewValidationGeneration = {};
 var optimizerPreviewValidationGeneration = 0;
+function adviceCancelPendingPreviewValidation(provider) {
+  if (provider !== 'claude' && provider !== 'codex') { return 0; }
+  var generation = (advicePreviewValidationGeneration[provider] || 0) + 1;
+  advicePreviewValidationGeneration[provider] = generation;
+  return generation;
+}
+function adviceInvalidateAndClearPreview(provider) {
+  adviceCancelPendingPreviewValidation(provider);
+  adviceClearPreview(provider);
+}
+function adviceInvalidateAllPreviews() {
+  adviceInvalidateAndClearPreview('claude');
+  adviceInvalidateAndClearPreview('codex');
+}
 function ccuProviderName() {
   var selected = document.querySelector('.provider-tab[aria-selected="true"]');
   return selected ? (selected.getAttribute('data-provider') || selected.id.replace('provider-tab-', '')) : 'claude';
@@ -12482,7 +12560,7 @@ document.addEventListener('change', function(event) {
   if (!elements.aggregate || !elements.prompt) { return; }
   if (!elements.aggregate.checked) { elements.prompt.checked = false; }
   adviceSyncConsentControls(provider);
-  adviceClearPreview(provider);
+  adviceInvalidateAndClearPreview(provider);
   vscode.postMessage({ command: 'discardAdviceSnapshot', provider: provider });
   adviceSetConsentPending(provider, true);
   vscode.postMessage({
@@ -12515,6 +12593,7 @@ document.addEventListener('click', function(event) {
     event.preventDefault();
     var elements = adviceConsentElements(provider);
     if (!elements.aggregate || !elements.prompt || !elements.aggregate.checked) { return; }
+    adviceCancelPendingPreviewValidation(provider);
     action.disabled = true;
     if (elements.consentStatus) { elements.consentStatus.textContent = ''; }
     vscode.postMessage({
@@ -12586,6 +12665,7 @@ document.addEventListener('click', function(event) {
     event.preventDefault();
     if (!window.confirm(__adviceCopy.clearLocalDataConfirm)) { return; }
     action.disabled = true;
+    adviceInvalidateAllPreviews();
     vscode.postMessage({ command: 'clearAdviceLocalData' });
   }
 });
@@ -12593,6 +12673,11 @@ document.addEventListener('click', function(event) {
 // Handle messages from extension
 window.addEventListener('message', async function(event) {
   const message = event.data;
+
+  if (message.command === 'advicePreviewsInvalidated') {
+    adviceInvalidateAllPreviews();
+    return;
+  }
 
   if (message.command === 'dashboardDataPatch') {
     ccuApplyDashboardDataPatch(message);
@@ -12616,6 +12701,9 @@ window.addEventListener('message', async function(event) {
   if (message.command === 'localDataClientAction') {
     var localDataClientActionOk = false;
     try {
+      if (message.action === 'clear-all-client-state') {
+        adviceInvalidateAllPreviews();
+      }
       localDataClientActionOk = ccuApplyLocalDataClientAction(message.action) === true;
     } catch (e) {}
     if (typeof message.requestId === 'string' && message.requestId.length > 0) {
@@ -12666,9 +12754,13 @@ window.addEventListener('message', async function(event) {
         consentElements.aggregate.checked = message.aggregateConsent === 'explicit';
         consentElements.prompt.checked =
           consentElements.aggregate.checked && message.promptSampleConsent === 'explicit';
+        if (!consentElements.aggregate.checked) {
+          adviceInvalidateAndClearPreview(consentProvider);
+        }
         adviceSetConsentPending(consentProvider, false);
         if (consentElements.consentStatus) { consentElements.consentStatus.textContent = ''; }
       } else {
+        adviceInvalidateAndClearPreview(consentProvider);
         consentElements.aggregate.checked = false;
         consentElements.prompt.checked = false;
         consentElements.aggregate.disabled = true;
@@ -12683,11 +12775,9 @@ window.addEventListener('message', async function(event) {
 
   if (message.command === 'adviceSnapshotResult') {
     var snapshotProvider = message.provider;
-    var snapshotValidationGeneration =
-      (advicePreviewValidationGeneration[snapshotProvider] || 0) + 1;
-    advicePreviewValidationGeneration[snapshotProvider] = snapshotValidationGeneration;
+    if (snapshotProvider !== 'claude' && snapshotProvider !== 'codex') { return; }
+    var snapshotValidationGeneration = adviceCancelPendingPreviewValidation(snapshotProvider);
     var snapshotElements = adviceConsentElements(snapshotProvider);
-    if (snapshotElements.previewButton) { snapshotElements.previewButton.disabled = false; }
     adviceClearPreview(snapshotProvider);
     var validSnapshot =
       message.ok === true &&
@@ -12708,6 +12798,21 @@ window.addEventListener('message', async function(event) {
       );
     }
     if (advicePreviewValidationGeneration[snapshotProvider] !== snapshotValidationGeneration) {
+      return;
+    }
+    var currentSnapshotElements = adviceConsentElements(snapshotProvider);
+    var currentConsentValid =
+      currentSnapshotElements.root === snapshotElements.root &&
+      currentSnapshotElements.preview === snapshotElements.preview &&
+      currentSnapshotElements.aggregate &&
+      !currentSnapshotElements.aggregate.disabled &&
+      currentSnapshotElements.aggregate.checked &&
+      (message.dataMode === 'aggregates-only' ||
+        (currentSnapshotElements.prompt &&
+          !currentSnapshotElements.prompt.disabled &&
+          currentSnapshotElements.prompt.checked));
+    if (!currentConsentValid) {
+      adviceClearPreview(snapshotProvider);
       return;
     }
     if (!validSnapshot || !snapshotElements.preview) {
@@ -12762,7 +12867,7 @@ window.addEventListener('message', async function(event) {
       if (sendElements.consentStatus) {
         sendElements.consentStatus.textContent = __adviceCopy.sentPreparedRequest;
       }
-      adviceClearPreview(sendProvider);
+      adviceInvalidateAndClearPreview(sendProvider);
     } else {
       if (sendElements.sendButton) {
         sendElements.sendButton.disabled = false;
@@ -12834,6 +12939,9 @@ window.addEventListener('message', async function(event) {
     document.querySelectorAll('[data-advice-action="clear"]').forEach(function(button) {
       button.disabled = false;
     });
+  }
+  if (message.command === 'adviceClearResult' && message.ok === true) {
+    adviceInvalidateAllPreviews();
   }
 
   if (message.command === 'shareCardResult') {
