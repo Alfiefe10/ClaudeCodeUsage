@@ -221,6 +221,9 @@ function shownWindows(windows: QuotaWindow[] | null, opts: QuotaStatusOptions): 
 //   {model:NAME.FIELD}     a per-model weekly cap, matched on the API's own
 //                          scope label, case-insensitively
 //   FIELD is pct | reset | label
+//   reset follows resetCountdownFormat unless it names a style of its own:
+//   {5h.reset:decimal} "4.8h", :units "4h 48m", :clock "18:20" / "2026-07-22",
+//   :at "16:59" / "Thu 16:59" (the tooltip's wall clock)
 //   {{ and }} are literal braces
 //
 // Separators (| · / , -) cut the template into segments. A segment whose
@@ -238,10 +241,19 @@ const SEPARATOR = /(\s*[|·/,-]+\s*)/;
 
 type TemplateField = 'pct' | 'reset' | 'label';
 
+/** 'at' is the wall clock; the rest are the resetCountdownFormat values. */
+type ResetStyle = ResetCountdownFormat | 'at';
+
+interface TemplateToken {
+  name: string;
+  field: TemplateField;
+  style?: ResetStyle; // reset only; absent means "follow the global format"
+}
+
 type TemplatePart =
   | { kind: 'text'; text: string }
   | { kind: 'unknown'; text: string }
-  | { kind: 'token'; name: string; field: TemplateField };
+  | ({ kind: 'token' } & TemplateToken);
 
 /** Stands in for a token whose window the account does not report, so the
  *  spacing that surrounded it can close up without a trace. */
@@ -251,18 +263,25 @@ const GAP_RUN = /(\s*)\u0000(\s*)/g;
 /** Splits "model:Fable 5.1.pct" into its window name and field. Uses the LAST
  *  dot, because a model name can contain one. Returns null when the token is
  *  not a window.field pair this formatter knows. */
-function parseToken(body: string): { name: string; field: TemplateField } | null {
+function parseToken(body: string): TemplateToken | null {
   const dot = body.lastIndexOf('.');
   if (dot <= 0) {
     return null;
   }
   const name = body.slice(0, dot).trim().toLowerCase();
-  const field = body.slice(dot + 1).trim().toLowerCase();
+  const [field, style, ...rest] = body
+    .slice(dot + 1)
+    .split(':')
+    .map((p) => p.trim().toLowerCase());
   const known = name === '5h' || name === 'wk' || name === '7d' || /^model:./.test(name);
-  if (!known || (field !== 'pct' && field !== 'reset' && field !== 'label')) {
+  if (!known || rest.length > 0 || (field !== 'pct' && field !== 'reset' && field !== 'label')) {
     return null;
   }
-  return { name, field };
+  if (style === undefined) {
+    return { name, field };
+  }
+  const styled = style === 'decimal' || style === 'units' || style === 'clock' || style === 'at';
+  return field === 'reset' && styled ? { name, field, style } : null;
 }
 
 function parseTemplate(template: string): TemplatePart[] {
@@ -318,6 +337,14 @@ function templateWindows(windows: QuotaWindow[], template: string): QuotaWindow[
     }
   }
   return found;
+}
+
+function templateReset(resetsAt: string, now: number, style?: ResetStyle): string {
+  if (style !== 'at') {
+    return compactReset(resetsAt, now, style);
+  }
+  const t = Date.parse(resetsAt);
+  return isNaN(t) ? '' : wallClockReset(new Date(t), now);
 }
 
 /** Renders a template against the live windows. '' when nothing survives, which
@@ -380,7 +407,8 @@ function formatQuotaTemplate(
     } else if (part.field === 'label') {
       segment += segmentLabel(w);
     } else {
-      segment += compactReset(w.resetsAt, now, resetFormat);
+      // A reset the API left blank closes up the same way a missing window does.
+      segment += templateReset(w.resetsAt, now, part.style ?? resetFormat) || GAP;
     }
   }
   endSegment('');

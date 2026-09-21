@@ -328,7 +328,9 @@ same full-request preview and separate explicit Send action as AI advice.
 - **Quota status bar format** — `statusBarQuotaFormat` (⚙ Settings) lets you name
   the windows yourself when the built-in `5h 6% · wk 1%` is not the layout you
   want: `{5h.pct}`, `{wk.pct}` (or `{7d.pct}`) and `{model:Fable.pct}`, each
-  also taking `.reset` and `.label`. For example
+  also taking `.reset` and `.label`. `.reset` follows `resetCountdownFormat`
+  unless it names its own style: `{5h.reset:units}` (`4h 48m`), `:decimal`
+  (`4.8h`), `:clock` (`18:20`) or `:at` (wall clock, `Thu 16:59`). For example
   `{5h.pct} | {7d.pct} · {model:Fable.pct}` renders `6% | 1% · 12%`. Empty
   (the default) keeps the built-in layout; a template supersedes the two
   options above, since it already says which windows to show. A window your

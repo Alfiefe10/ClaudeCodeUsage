@@ -415,6 +415,36 @@ test('a clock reset keeps its date intact', () => {
   );
 });
 
+test('a reset token can name its own style, whatever the global one is', () => {
+  // The global format is one setting for the whole bar; a style on the token is
+  // what lets a countdown for the 5h window sit beside a wall clock for the week.
+  const t = '{5h.reset:units} | {wk.reset:decimal} | {5h.reset:clock} | {5h.reset}';
+  assert.equal(formatQuotaStatusText(live, { ...base, template: t }), '4h 48m | 1.6d | 16:48 | 4.8h');
+  assert.equal(
+    formatQuotaStatusText(live, { ...base, template: t, resetFormat: 'clock' }),
+    '4h 48m | 1.6d | 16:48 | 16:48'
+  );
+});
+
+test('reset:at is the wall clock, with a weekday once it is not today', () => {
+  assert.equal(formatQuotaStatusText(live, { ...base, template: '{5h.reset:at}' }), '16:48');
+  assert.match(formatQuotaStatusText(live, { ...base, template: '{wk.reset:at}' }), /^.+ 02:24$/);
+  assert.match(
+    formatQuotaStatusText(live, { ...base, template: '{model:Fable 5.1.reset:at}' }),
+    /^$/ // no such cap on this account: the dotted name still parses, and drops
+  );
+});
+
+test('an unknown reset style, or a style on another field, is a visible typo', () => {
+  assert.equal(formatQuotaStatusText(live, { ...base, template: '{5h.reset:hours}' }), '{5h.reset:hours}');
+  assert.equal(formatQuotaStatusText(live, { ...base, template: '{5h.pct:units}' }), '{5h.pct:units}');
+});
+
+test('a reset the API left blank closes up like a missing window', () => {
+  const fresh: QuotaWindow[] = [{ kind: 'session', utilization: 0, decimals: 0, resetsAt: '', isActive: false }];
+  assert.equal(formatQuotaStatusText(fresh, { ...base, template: '{5h.pct} {5h.reset} left' }), '0% left');
+});
+
 test('label tokens give the same short names the built-in layout uses', () => {
   assert.equal(
     formatQuotaStatusText(live, { ...base, template: '{5h.label} {5h.pct} · {wk.label} {wk.pct}' }),

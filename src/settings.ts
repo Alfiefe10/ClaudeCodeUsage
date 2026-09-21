@@ -573,7 +573,7 @@ export const SETTINGS: SettingDef[] = [
     storage: 'state',
     group: 'statusBar',
     label: 'Quota: status bar format',
-    help: 'Empty keeps the built-in layout (5h 6% · wk 1%). Otherwise: {5h.pct}, {wk.pct} (or {7d.pct}) and {model:Fable.pct}, each also taking .reset and .label — e.g. "{5h.pct} | {7d.pct} · {model:Fable.pct}". A window your plan does not report renders empty.',
+    help: 'Empty keeps the built-in layout (5h 6% · wk 1%). Otherwise: {5h.pct}, {wk.pct} (or {7d.pct}) and {model:Fable.pct}, each also taking .reset and .label — e.g. "{5h.pct} | {7d.pct} · {model:Fable.pct}". A window your plan does not report renders empty. .reset can name its own style: {5h.reset:units}, :decimal, :clock or :at (wall clock).',
     maxLength: 120,
   },
   {
