@@ -6,6 +6,15 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
 
 ## [2.3.3] — Unreleased
 
+### Added
+- **`statusBarQuotaFormat`** (default empty) — name the quota windows in the
+  status bar yourself when you want a different set, order or separators than
+  the built-in `5h 6% · wk 1%`: `{5h.pct}`, `{wk.pct}` (or `{7d.pct}`) and
+  `{model:Fable.pct}`, each also taking `.reset` and `.label`. Empty keeps the
+  built-in layout, and a template supersedes `quotaFiveHourOnly` and
+  `showScopedWeekly` since it names its windows itself. A segment whose window
+  your account does not report is dropped along with its separator.
+
 ### Fixed
 - **Startup with legacy workspace advice keys (#105)** — a workspace-scoped
   plaintext BYOK key or unavailable SecretStorage no longer prevents the usage
