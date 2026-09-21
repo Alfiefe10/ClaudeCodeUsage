@@ -459,6 +459,37 @@ test('an unrecognised token is left verbatim so a typo stays visible', () => {
   assert.equal(formatQuotaStatusText(live, { ...base, template: '{nope.pct}' }), '{nope.pct}');
 });
 
+test('literal spacing is kept as typed', () => {
+  assert.equal(formatQuotaStatusText(live, { ...base, template: 'A   B {5h.pct}' }), 'A   B 6%');
+  assert.equal(formatQuotaStatusText(live, { ...base, template: '{5h.pct}   {wk.pct}' }), '6%   1%');
+});
+
+test('a vanished token closes its own gap without disturbing the rest', () => {
+  // The space either side of the missing cap collapses to one, so the line does
+  // not show where something used to be.
+  assert.equal(
+    formatQuotaStatusText(live, { ...base, template: '{5h.pct} {model:Opus.pct} {wk.pct}' }),
+    '6% 1%'
+  );
+  assert.equal(
+    formatQuotaStatusText(live, { ...base, template: '{5h.pct}{model:Opus.pct}{wk.pct}' }),
+    '6%1%'
+  );
+});
+
+test('an unrecognised token survives even beside a window the account lacks', () => {
+  // Dropping the segment would take the typo with it, and a silently shorter
+  // line is exactly what the verbatim rule exists to prevent.
+  assert.equal(
+    formatQuotaStatusText(live, { ...base, template: '{nope.pct} {model:Opus.pct}' }),
+    '{nope.pct}'
+  );
+  assert.equal(
+    formatQuotaStatusText(live, { ...base, template: '{5h.pct} | {nope.pct} {model:Opus.pct}' }),
+    '6% | {nope.pct}'
+  );
+});
+
 test('a template that renders to nothing returns empty so the item hides', () => {
   assert.equal(formatQuotaStatusText(live, { ...base, template: '{model:Opus.pct}' }), '');
   assert.equal(formatQuotaStatusText(live, { ...base, template: '{model:Opus.pct} | ' }), '');

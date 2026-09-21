@@ -240,7 +240,13 @@ type TemplateField = 'pct' | 'reset' | 'label';
 
 type TemplatePart =
   | { kind: 'text'; text: string }
+  | { kind: 'unknown'; text: string }
   | { kind: 'token'; name: string; field: TemplateField };
+
+/** Stands in for a token whose window the account does not report, so the
+ *  spacing that surrounded it can close up without a trace. */
+const GAP = '\u0000';
+const GAP_RUN = /(\s*)\u0000(\s*)/g;
 
 /** Splits "model:Fable 5.1.pct" into its window name and field. Uses the LAST
  *  dot, because a model name can contain one. Returns null when the token is
@@ -273,7 +279,7 @@ function parseTemplate(template: string): TemplatePart[] {
       continue;
     }
     const token = parseToken(m[1]);
-    parts.push(token ? { kind: 'token', ...token } : { kind: 'text', text: m[0] });
+    parts.push(token ? { kind: 'token', ...token } : { kind: 'unknown', text: m[0] });
   }
   if (last < template.length) {
     parts.push({ kind: 'text', text: template.slice(last) });
@@ -327,15 +333,22 @@ function formatQuotaTemplate(
   let segment = '';
   let named = 0; // window tokens in this segment...
   let reported = 0; // ...and how many of them the account reports
+  let unknown = false; // ...and whether one of them was a typo
   const endSegment = (nextSep: string): void => {
-    const text = segment.replace(/\s+/g, ' ').trim();
-    if (text && (named === 0 || reported > 0)) {
+    const text = segment
+      .replace(GAP_RUN, (_m, before: string, after: string) => (before || after ? ' ' : ''))
+      .trim();
+    // Nothing named, or something named and present: print it. A segment that
+    // named only windows the account lacks goes, unless it also carries a typo,
+    // which has to stay visible.
+    if (text && (named === 0 || reported > 0 || unknown)) {
       out = out ? out + sep + text : text;
     }
     sep = nextSep;
     segment = '';
     named = 0;
     reported = 0;
+    unknown = false;
   };
 
   for (const part of parseTemplate(template)) {
@@ -350,9 +363,15 @@ function formatQuotaTemplate(
       });
       continue;
     }
+    if (part.kind === 'unknown') {
+      segment += part.text;
+      unknown = true;
+      continue;
+    }
     named++;
     const w = tokenWindow(windows, part.name);
     if (!w) {
+      segment += GAP;
       continue;
     }
     reported++;

@@ -325,6 +325,14 @@ same full-request preview and separate explicit Send action as AI advice.
 - **Quota display options** — `quotaFiveHourOnly` (show only the 5h
   window) and `showResetInStatusBar` (append the reset countdown, e.g.
   `5h:50%:2.3h | wk:30%:3.2d`), both in ⚙ Settings.
+- **Quota status bar format** — `statusBarQuotaFormat` (⚙ Settings) lets you name
+  the windows yourself when the built-in `5h 6% · wk 1%` is not the layout you
+  want: `{5h.pct}`, `{wk.pct}` (or `{7d.pct}`) and `{model:Fable.pct}`, each
+  also taking `.reset` and `.label`. For example
+  `{5h.pct} | {7d.pct} · {model:Fable.pct}` renders `6% | 1% · 12%`. Empty
+  (the default) keeps the built-in layout; a template supersedes the two
+  options above, since it already says which windows to show. A window your
+  account does not report drops out along with its separator.
 - **Wider dashboard** — detail page widened to 1600 px, still fluid
   on narrow screens.
 - **Workflows tab** — every multi-agent run in one place: dynamic-workflow
