@@ -4,7 +4,7 @@ All notable changes to this fork compared to upstream
 [`ClaudeCodeUsage/ClaudeCodeUsage`](https://github.com/ClaudeCodeUsage/ClaudeCodeUsage) (last
 upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangelog.com).
 
-## [2.3.3] — Unreleased
+## [Unreleased]
 
 ### Added
 - **`statusBarQuotaFormat`** (default empty) — name the quota windows in the

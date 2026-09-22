@@ -327,18 +327,6 @@ same full-request preview and separate explicit Send action as AI advice.
 - **Quota display options** — `quotaFiveHourOnly` (show only the 5h
   window) and `showResetInStatusBar` (append the reset countdown, e.g.
   `5h:50%:2.3h | wk:30%:3.2d`), both in ⚙ Settings.
-- **Quota status bar format** — the compact ⚙ Settings dropdown keeps the built-in
-  layout by default, offers 5-hour and Weekly presets, and reveals
-  `statusBarQuotaFormat` only under Custom. It lets you name
-  the windows yourself when the built-in `5h 6% · wk 1%` is not the layout you
-  want: `{5h.pct}`, `{wk.pct}` (or `{7d.pct}`) and `{model:Fable.pct}`, each
-  also taking `.reset` and `.label`. `.reset` follows `resetCountdownFormat`
-  unless it names its own style: `{5h.reset:units}` (`4h 48m`), `:decimal`
-  (`4.8h`), `:clock` (`18:20`) or `:at` (wall clock, `Thu 16:59`). For example
-  `{5h.pct} | {7d.pct} · {model:Fable.pct}` renders `6% | 1% · 12%`. Empty
-  (the default) keeps the built-in layout; a template supersedes the two
-  options above, since it already says which windows to show. A window your
-  account does not report drops out along with its separator.
 - **Wider dashboard** — detail page widened to 1600 px, still fluid
   on narrow screens.
 - **Workflows tab** — every multi-agent run in one place: dynamic-workflow
@@ -462,6 +450,13 @@ Everything else — refresh interval, status-bar items, number/date formatting,
 project grouping, content analysis, and all the AI advice / Optimizer options —
 is in the dashboard's ⚙ Settings tab. Upgrading keeps your existing values: a
 one-time migration copies them out of `settings.json` on first launch.
+
+For a custom quota status-bar layout, choose **Custom** in ⚙ Settings. The
+template accepts `{5h.pct}`, `{wk.pct}` (or `{7d.pct}`), and
+`{model:Fable.pct}`; each window also supports `.label` and `.reset`.
+Reset styles include `:decimal`, `:units`, `:clock`, and `:at`, for example
+`{5h.pct} | {wk.reset:at}`. Missing windows and their separators are omitted.
+The built-in choice leaves the existing quota options unchanged.
 
 ---
 
