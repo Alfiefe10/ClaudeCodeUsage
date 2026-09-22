@@ -7,6 +7,14 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
 ## [2.3.3] — Unreleased
 
 ### Fixed
+- **Full re-read when several sessions append at once (#99)** — the content
+  analysis fast path required exactly one changed file, so a machine running
+  more than one agent never took it: every refresh rebuilt all contributions
+  from every file. Any number of pure tail appends now stays incremental.
+  Appends are parsed in full-scan order and new-UUID ownership is attributed to
+  the owning file, so results match the full loader. Measured on 15 real
+  transcripts (34 MB) with three files appended: 15 body reads and 8.7 s became
+  3 body reads and 0.6 s.
 - **High CPU during indexing (#99)** — day, month and hour bucketing no longer
   constructs a fresh `Intl.DateTimeFormat` for every ingested record. The
   resolved zone and both formatters are memoised per zone, so a large local
