@@ -16,7 +16,9 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
   Empty keeps the built-in layout, and a template supersedes
   `quotaFiveHourOnly` and `showScopedWeekly` since it names its windows itself.
   A segment whose window your account does not report is dropped along with its
-  separator.
+  separator. The dashboard keeps this optional feature compact: a Built-in,
+  5-hour-only, Weekly-only, or Custom dropdown reveals the template field only
+  when Custom is selected.
 
 ### Fixed
 - **Full rebuild whenever a new transcript appeared (#99)** — a file that had

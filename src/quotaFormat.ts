@@ -235,6 +235,13 @@ function shownWindows(windows: QuotaWindow[] | null, opts: QuotaStatusOptions): 
 
 const TEMPLATE_TOKEN = /\{\{|\}\}|\{([^{}]+)\}/g;
 
+// Short choices for the dashboard control. The free-form grammar remains
+// available only when someone explicitly selects Custom.
+export const FIVE_HOUR_QUOTA_STATUS_TEMPLATE = '{5h.label} {5h.pct}';
+export const WEEKLY_QUOTA_STATUS_TEMPLATE = '{wk.label} {wk.pct}';
+export const CUSTOM_QUOTA_STATUS_TEMPLATE =
+  `${FIVE_HOUR_QUOTA_STATUS_TEMPLATE} · ${WEEKLY_QUOTA_STATUS_TEMPLATE}`;
+
 /** A separator run, captured with its own spacing so the bar shows it exactly
  *  as it was typed. */
 const SEPARATOR = /(\s*[|·/,-]+\s*)/;

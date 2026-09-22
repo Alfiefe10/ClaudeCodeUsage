@@ -138,6 +138,11 @@ export interface Translations {
     settingsGroupProviders: string;
     settingsGroupFeatures: string;
     settingsGroupStatusBar: string;
+    quotaFormatBuiltIn: string;
+    quotaFormatFiveHour: string;
+    quotaFormatWeekly: string;
+    quotaFormatCustom: string;
+    quotaFormatShortHelp: string;
     settingsGroupData: string;
     settingsGroupAdvice: string;
     adviceEffectiveness: AdviceEffectivenessTranslations;
@@ -1215,6 +1220,11 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsGroupProviders: 'Providers',
       settingsGroupFeatures: 'Optional features',
       settingsGroupStatusBar: 'Status bar',
+      quotaFormatBuiltIn: 'Built-in',
+      quotaFormatFiveHour: '5-hour only',
+      quotaFormatWeekly: 'Weekly only',
+      quotaFormatCustom: 'Custom…',
+      quotaFormatShortHelp: 'Choose a compact layout. Built-in keeps the quota options above.',
       settingsGroupData: 'Data & refresh',
       settingsGroupAdvice: 'AI advice & Optimizer',
       adviceEffectiveness: {
@@ -1516,6 +1526,11 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsGroupProviders: "Anbieter",
       settingsGroupFeatures: "Optionale Funktionen",
       settingsGroupStatusBar: "Statusleiste",
+      quotaFormatBuiltIn: 'Standard',
+      quotaFormatFiveHour: 'Nur 5 Stunden',
+      quotaFormatWeekly: 'Nur Woche',
+      quotaFormatCustom: 'Benutzerdefiniert…',
+      quotaFormatShortHelp: 'Kompaktes Layout wählen. „Standard“ übernimmt die obigen Kontingentoptionen.',
       settingsGroupData: "Daten & Aktualisierung",
       settingsGroupAdvice: "KI-Beratung & Optimizer",
       adviceEffectiveness: {
@@ -1820,6 +1835,11 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsGroupProviders: '供應商',
       settingsGroupFeatures: '選用功能',
       settingsGroupStatusBar: '狀態列',
+      quotaFormatBuiltIn: '內建',
+      quotaFormatFiveHour: '僅 5 小時',
+      quotaFormatWeekly: '僅每週',
+      quotaFormatCustom: '自訂…',
+      quotaFormatShortHelp: '選擇精簡版面；「內建」沿用上方配額選項。',
       settingsGroupData: '資料與重新整理',
       settingsGroupAdvice: 'AI 建議與最佳化工具',
       adviceEffectiveness: {
@@ -2117,6 +2137,11 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsGroupProviders: '供应商',
       settingsGroupFeatures: '可选功能',
       settingsGroupStatusBar: '状态栏',
+      quotaFormatBuiltIn: '默认',
+      quotaFormatFiveHour: '仅 5 小时',
+      quotaFormatWeekly: '仅每周',
+      quotaFormatCustom: '自定义…',
+      quotaFormatShortHelp: '选择简洁布局；“默认”沿用上方额度选项。',
       settingsGroupData: '数据与刷新',
       settingsGroupAdvice: 'AI 建议与优化器',
       adviceEffectiveness: {
@@ -2414,6 +2439,11 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsGroupProviders: 'プロバイダー',
       settingsGroupFeatures: 'オプション機能',
       settingsGroupStatusBar: 'ステータスバー',
+      quotaFormatBuiltIn: '標準',
+      quotaFormatFiveHour: '5時間のみ',
+      quotaFormatWeekly: '週のみ',
+      quotaFormatCustom: 'カスタム…',
+      quotaFormatShortHelp: '簡潔な表示を選択します。「標準」は上の利用枠設定を使います。',
       settingsGroupData: 'データと更新',
       settingsGroupAdvice: 'AI アドバイス & オプティマイザー',
       adviceEffectiveness: {
@@ -2716,6 +2746,11 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsGroupProviders: '공급자',
       settingsGroupFeatures: '선택 기능',
       settingsGroupStatusBar: '상태 표시줄',
+      quotaFormatBuiltIn: '기본',
+      quotaFormatFiveHour: '5시간만',
+      quotaFormatWeekly: '주간만',
+      quotaFormatCustom: '사용자 지정…',
+      quotaFormatShortHelp: '간결한 표시를 선택하세요. 기본은 위의 한도 옵션을 따릅니다.',
       settingsGroupData: '데이터 및 새로고침',
       settingsGroupAdvice: 'AI 조언 & 옵티마이저',
       adviceEffectiveness: {
@@ -3018,6 +3053,11 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsGroupProviders: 'Provedores',
       settingsGroupFeatures: 'Recursos opcionais',
       settingsGroupStatusBar: 'Barra de status',
+      quotaFormatBuiltIn: 'Padrão',
+      quotaFormatFiveHour: 'Só 5 horas',
+      quotaFormatWeekly: 'Só semanal',
+      quotaFormatCustom: 'Personalizado…',
+      quotaFormatShortHelp: 'Escolha um layout compacto. Padrão mantém as opções de limite acima.',
       settingsGroupData: 'Dados e atualização',
       settingsGroupAdvice: 'Conselho de IA e Optimizer',
       adviceEffectiveness: {
@@ -3319,6 +3359,11 @@ const translations: Record<SupportedLanguage, Translations> = {
       settingsGroupProviders: 'Penyedia',
       settingsGroupFeatures: 'Fitur opsional',
       settingsGroupStatusBar: 'Status bar',
+      quotaFormatBuiltIn: 'Bawaan',
+      quotaFormatFiveHour: 'Hanya 5 jam',
+      quotaFormatWeekly: 'Hanya mingguan',
+      quotaFormatCustom: 'Kustom…',
+      quotaFormatShortHelp: 'Pilih tampilan ringkas. Bawaan mengikuti opsi kuota di atas.',
       settingsGroupData: 'Data & penyegaran',
       settingsGroupAdvice: 'Saran AI & Optimizer',
       adviceEffectiveness: {

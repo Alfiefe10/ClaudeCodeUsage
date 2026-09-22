@@ -100,6 +100,8 @@ Hover the quota indicator for a breakdown:
 *Real `/usage` data: utilisation percent, plus time left and the wall-clock reset for every window.*
 *Every weekly cap your plan meters gets its own row, per-model ones included (Anthropic supplies the name, so the row follows whichever model is capped), plus usage credits when you have them enabled.*
 
+⚙ Settings offers a compact quota-format dropdown: Built-in (default), 5-hour only, Weekly only, or Custom. Only Custom reveals the template field.
+
 ### Dashboard
 
 ![Dashboard — summary and charts](images/v2-dashboard-en.png)
@@ -325,7 +327,9 @@ same full-request preview and separate explicit Send action as AI advice.
 - **Quota display options** — `quotaFiveHourOnly` (show only the 5h
   window) and `showResetInStatusBar` (append the reset countdown, e.g.
   `5h:50%:2.3h | wk:30%:3.2d`), both in ⚙ Settings.
-- **Quota status bar format** — `statusBarQuotaFormat` (⚙ Settings) lets you name
+- **Quota status bar format** — the compact ⚙ Settings dropdown keeps the built-in
+  layout by default, offers 5-hour and Weekly presets, and reveals
+  `statusBarQuotaFormat` only under Custom. It lets you name
   the windows yourself when the built-in `5h 6% · wk 1%` is not the layout you
   want: `{5h.pct}`, `{wk.pct}` (or `{7d.pct}`) and `{model:Fable.pct}`, each
   also taking `.reset` and `.label`. `.reset` follows `resetCountdownFormat`

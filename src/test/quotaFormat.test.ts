@@ -6,7 +6,10 @@ import * as assert from 'node:assert/strict';
 
 import {
   CONTEXT_FILL_THRESHOLDS,
+  CUSTOM_QUOTA_STATUS_TEMPLATE,
+  FIVE_HOUR_QUOTA_STATUS_TEMPLATE,
   QUOTA_FILL_THRESHOLDS,
+  WEEKLY_QUOTA_STATUS_TEMPLATE,
   compactReset,
   fillLevel,
   formatMonthlyReset,
@@ -363,6 +366,12 @@ const base = { showReset: false, fiveHourOnly: false, showScopedWeekly: false, n
 test('an empty template keeps the built-in layout', () => {
   assert.equal(formatQuotaStatusText(live, { ...base, template: '' }), '5h 6% · wk 1%');
   assert.equal(formatQuotaStatusText(live, { ...base, template: '   ' }), '5h 6% · wk 1%');
+});
+
+test('dashboard presets render short, named quota windows', () => {
+  assert.equal(formatQuotaStatusText(live, { ...base, template: FIVE_HOUR_QUOTA_STATUS_TEMPLATE }), '5h 6%');
+  assert.equal(formatQuotaStatusText(live, { ...base, template: WEEKLY_QUOTA_STATUS_TEMPLATE }), 'wk 1%');
+  assert.equal(formatQuotaStatusText(live, { ...base, template: CUSTOM_QUOTA_STATUS_TEMPLATE }), '5h 6% · wk 1%');
 });
 
 test('a template renders the windows it names', () => {
