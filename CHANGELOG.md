@@ -19,6 +19,28 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
   separator.
 
 ### Fixed
+- **Full rebuild whenever a new transcript appeared (#99)** — a file that had
+  just been created was treated as an unsafe mutation, so every new session
+  rebuilt every contribution in the corpus. A new file is now read in full on
+  its own while the established files stay untouched; ordering state is
+  recomputed from metadata, and a new file carrying an already-owned UUID still
+  falls back to the full rebuild. Measured on 15 real transcripts with two
+  appends and one new file: 16 body reads and 3042 ms became 3 body reads and
+  567 ms.
+- **Full re-read when several sessions append at once (#99)** — the content
+  analysis fast path required exactly one changed file, so a machine running
+  more than one agent never took it: every refresh rebuilt all contributions
+  from every file. Any number of pure tail appends now stays incremental.
+  Appends are parsed in full-scan order and new-UUID ownership is attributed to
+  the owning file, so results match the full loader. Measured on 15 real
+  transcripts (34 MB) with three files appended: 15 body reads and 8.7 s became
+  3 body reads and 0.6 s.
+- **High CPU during indexing (#99)** — day, month and hour bucketing no longer
+  constructs a fresh `Intl.DateTimeFormat` for every ingested record. The
+  resolved zone and both formatters are memoised per zone, so a large local
+  history is indexed without pinning a core. On a 1.4 GB history the key
+  derivation went from ~1.1k to ~168k records/second (158x) with identical
+  keys; invalid and empty zones still fall back exactly as before.
 - **Startup with legacy workspace advice keys (#105)** — a workspace-scoped
   plaintext BYOK key or unavailable SecretStorage no longer prevents the usage
   status bar, commands, and dashboard from activating. The old key remains

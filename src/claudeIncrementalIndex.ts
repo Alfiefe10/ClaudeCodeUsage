@@ -2588,14 +2588,25 @@ export async function updateClaudeUsageIndex(
   let forcedFullAnalysisRebuild = false;
   if (analyzeContent) {
     const sourcePlans = plans.filter((plan) => plan.analysisReason === 'source');
-    const soleSourcePlan = sourcePlans.length === 1 && plans.length === 1
-      ? sourcePlans[0]
-      : undefined;
+    // Several sessions appending between two refreshes is the ordinary case on a
+    // machine running more than one agent, not an edge case: with the fast path
+    // limited to a single changed file, such a machine never took it and every
+    // refresh re-read the whole history. Any number of pure tail appends is
+    // safe here; the per-file UUID ownership check below still guards order.
+    // A file that simply appeared is as safe as a tail append: its own body is
+    // read in full, and the established contributions are untouched. Every new
+    // session starts a new transcript, so treating this as an unsafe mutation
+    // cost a full rebuild many times a day.
+    const isTailAppend = (plan: FilePlan): boolean =>
+      plan.kind === 'append' && Boolean(plan.prior) && (plan.prior?.firstTimestampMs ?? 0) > 0;
+    const isNewFile = (plan: FilePlan): boolean =>
+      plan.kind === 'rebuild' && !plan.prior && !plan.replacedFileId;
+    const appendOnlyPlans = plans.length > 0 && sourcePlans.length === plans.length &&
+      plans.every((plan) => isTailAppend(plan) || isNewFile(plan));
     const safeTailAppend = Boolean(
-      soleSourcePlan?.kind === 'append' && soleSourcePlan.prior &&
+      appendOnlyPlans &&
       previousAnalysisRuntime && !timeZoneChanged &&
-      previous.windowDays === windowDays && analysisPayloadRebases.size === 0 &&
-      soleSourcePlan.prior.firstTimestampMs > 0,
+      previous.windowDays === windowDays && analysisPayloadRebases.size === 0,
     );
     const priorAnalysisCutoffMs = previousAnalysisRuntime?.cutoffMs ??
       (previous.analyzeContent ? previous.analysisCutoffMs : undefined);
@@ -2660,7 +2671,9 @@ export async function updateClaudeUsageIndex(
     analyzeContent && previousAnalysisRuntime && previous.contentAnalysis &&
     !forcedFullAnalysisRebuild && calibrationCutoffIsStable &&
     analysisPayloadRebases.size === 0 && deletions.length === 0 && moves.length === 0 &&
-    plans.every((plan) => plan.kind === 'append' && Boolean(plan.prior)),
+    plans.every((plan) =>
+      (plan.kind === 'append' && Boolean(plan.prior)) ||
+      (plan.kind === 'rebuild' && !plan.prior && !plan.replacedFileId)),
   );
 
   await options.beforeBodyReads?.();
@@ -2705,11 +2718,13 @@ export async function updateClaudeUsageIndex(
             for (const uuid of file.analysis?.seenUuids ?? []) analysisSeenUuids.add(uuid);
           }
         }
-        const rebuildPlans = plans.filter((plan) => plan.kind === 'rebuild');
-        if (rebuildPlans.length > 0) {
+        // The first file to carry a UUID owns it, so parsing has to follow the
+        // same order the full loader uses. With one plan the order is moot, but
+        // several appends must be parsed in full-scan order — otherwise
+        // ownership falls to whichever file happened to be discovered first.
+        if (plans.length > 1) {
           plans.sort((left, right) => {
             if (left.kind !== right.kind) return left.kind === 'rebuild' ? -1 : 1;
-            if (left.kind === 'append') return 0;
             return (left.orderTimestampMs ?? 0) - (right.orderTimestampMs ?? 0) ||
               left.entry.discoveryIndex - right.entry.discoveryIndex;
           });
@@ -2738,21 +2753,37 @@ export async function updateClaudeUsageIndex(
     // collision changes the full loader's first owner, so retry the analysis as
     // one globally ordered rebuild. The first tail read remains bounded and is
     // the evidence used to choose the safe path.
-    if (fastAppendAnalysis && previousAnalysisRuntime && parsedPlans.length === 1 &&
-      parsedPlans[0].kind === 'append') {
-      const appended = parsedPlans[0];
-      const filePosition = previousAnalysisRuntime.filePositionById.get(appended.fileId) ?? -1;
-      let laterOwnerCollision = filePosition < 0;
-      for (const uuid of appended.analysisTouchedUuids) {
+    if (fastAppendAnalysis && previousAnalysisRuntime && parsedPlans.length > 0) {
+      let laterOwnerCollision = false;
+      for (const appended of parsedPlans) {
         if (laterOwnerCollision) break;
-        const ownerFileId = previousAnalysisRuntime.firstUuidFileByUuid.get(uuid);
-        if (!ownerFileId || ownerFileId === appended.fileId) continue;
-        const ownerPosition = previousAnalysisRuntime.filePositionById.get(ownerFileId);
-        if (ownerPosition === undefined) {
+        if (appended.kind === 'rebuild') {
+          // A brand-new file owns only UUIDs nobody else has: anything else can
+          // move ownership, which the full loader resolves by scan order.
+          for (const uuid of appended.analysisTouchedUuids) {
+            if (previousAnalysisRuntime.firstUuidFileByUuid.has(uuid)) {
+              laterOwnerCollision = true;
+              break;
+            }
+          }
+          continue;
+        }
+        const filePosition = previousAnalysisRuntime.filePositionById.get(appended.fileId) ?? -1;
+        if (filePosition < 0) {
           laterOwnerCollision = true;
           break;
         }
-        laterOwnerCollision = ownerPosition > filePosition;
+        for (const uuid of appended.analysisTouchedUuids) {
+          if (laterOwnerCollision) break;
+          const ownerFileId = previousAnalysisRuntime.firstUuidFileByUuid.get(uuid);
+          if (!ownerFileId || ownerFileId === appended.fileId) continue;
+          const ownerPosition = previousAnalysisRuntime.filePositionById.get(ownerFileId);
+          if (ownerPosition === undefined) {
+            laterOwnerCollision = true;
+            break;
+          }
+          laterOwnerCollision = ownerPosition > filePosition;
+        }
       }
       if (laterOwnerCollision) {
         forcedFullAnalysisRebuild = true;
@@ -2890,18 +2921,43 @@ export async function updateClaudeUsageIndex(
     // calibration identities, and the already-bounded prompt/skill samples.
     const merged = cloneAnalysisAcc(previousAnalysisRuntime.merged);
     const appended = new Map<string, AnalysisAcc>();
+    const addedFileIds: string[] = [];
     for (const plan of parsedPlans) {
-      if (!plan.prior?.analysis || !plan.contribution.analysis) continue;
-      addAppendAnalysisDelta(merged, plan.prior.analysis, plan.contribution.analysis);
+      if (!plan.contribution.analysis) continue;
+      if (plan.prior?.analysis) {
+        addAppendAnalysisDelta(merged, plan.prior.analysis, plan.contribution.analysis);
+      } else {
+        // A file that just appeared has no prior contribution: its whole
+        // analysis is the delta.
+        addAppendAnalysisDelta(
+          merged,
+          newAnalysisAcc(analysisCutoffMs),
+          plan.contribution.analysis,
+        );
+        addedFileIds.push(plan.fileId);
+      }
       appended.set(plan.fileId, plan.contribution.analysis);
     }
-    const promptTail = refreshedPromptTail(previousAnalysisRuntime, appended);
+    // Ordering state is reused as is for pure appends — recomputing it would
+    // touch every historical file. New files have to take their place in the
+    // order, and that is metadata-only work: no body is re-read.
+    const orderedState: AnalysisRuntimeState = addedFileIds.length === 0
+      ? previousAnalysisRuntime
+      : (() => {
+        const orderedFileIds = analysisFilesInOrder(next).map((file) => file.fileId);
+        return {
+          ...previousAnalysisRuntime,
+          orderedFileIds,
+          filePositionById: new Map(orderedFileIds.map((fileId, at) => [fileId, at])),
+        };
+      })();
+    const promptTail = refreshedPromptTail(orderedState, appended);
     const touchedToolIds = new Set<string>();
     for (const plan of parsedPlans) {
       for (const toolId of plan.analysisTouchedToolIds) touchedToolIds.add(toolId);
     }
     const structural = refreshedStructuralRuntime(
-      previousAnalysisRuntime,
+      orderedState,
       merged,
       appended,
       touchedToolIds,
@@ -2919,7 +2975,22 @@ export async function updateClaudeUsageIndex(
       ? new Map(previousAnalysisRuntime.firstUuidFileByUuid)
       : previousAnalysisRuntime.firstUuidFileByUuid;
     if (firstUuidFileByUuid instanceof Map) {
-      for (const uuid of analysisUuidAdditions) {
+      // With more than one appended file, ownership belongs to the file that
+      // comes first in the established order — not to whichever plan happened
+      // to be parsed first.
+      const appendedByOrder = [...parsedPlans].sort((left, right) =>
+        (orderedState.filePositionById.get(left.fileId) ?? 0) -
+        (orderedState.filePositionById.get(right.fileId) ?? 0));
+      const unassigned = new Set(analysisUuidAdditions);
+      for (const plan of appendedByOrder) {
+        if (unassigned.size === 0) break;
+        for (const uuid of plan.analysisTouchedUuids) {
+          if (!unassigned.delete(uuid)) continue;
+          firstUuidFileByUuid.set(uuid, plan.fileId);
+        }
+      }
+      // A UUID no appended file claims still needs an owner, as before.
+      for (const uuid of unassigned) {
         firstUuidFileByUuid.set(uuid, parsedPlans[0]?.fileId ?? '');
       }
     }
@@ -2935,8 +3006,8 @@ export async function updateClaudeUsageIndex(
     const runtime: AnalysisRuntimeState = {
       asOfDay: analysisAsOfDay,
       cutoffMs: analysisCutoffMs,
-      orderedFileIds: previousAnalysisRuntime.orderedFileIds,
-      filePositionById: previousAnalysisRuntime.filePositionById,
+      orderedFileIds: orderedState.orderedFileIds,
+      filePositionById: orderedState.filePositionById,
       merged,
       promptTail,
       skillHead,
